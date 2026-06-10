@@ -1,0 +1,647 @@
+#!/bin/sh
+# setup-link: Configure SQM, hardware offload, MTU, and TCP tuning for GL-MT3000
+#
+# New location? Just run:  setup-link arrive
+#
+# Manual control:
+#   setup-link test                                     Speed test + suggestions
+#   setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]  Apply SQM config
+#   setup-link off                                      Fast link: HW offload, no SQM
+#   setup-link wifi <ssid> <key>                        Join WiFi as repeater uplink
+#   setup-link country [CC]                             Set/detect WiFi country code
+#   setup-link status                                   Show current config
+
+set -e
+
+SQM_WAS_ENABLED=""
+STATE_FILE="/etc/setup-link.last"
+
+# --- helpers ---
+
+tune_tcp() {
+    tier="$1"  # slow (<50M), medium (50-100M), fast (>100M)
+    case "$tier" in
+        slow)
+            sysctl -qw net.ipv4.tcp_rmem="4096 32768 524288"
+            sysctl -qw net.ipv4.tcp_wmem="4096 16384 524288"
+            sysctl -qw net.ipv4.tcp_limit_output_bytes=131072
+            ;;
+        medium)
+            sysctl -qw net.ipv4.tcp_rmem="4096 131072 1048576"
+            sysctl -qw net.ipv4.tcp_wmem="4096 65536 1048576"
+            sysctl -qw net.ipv4.tcp_limit_output_bytes=262144
+            ;;
+        fast)
+            sysctl -qw net.ipv4.tcp_rmem="4096 131072 4194304"
+            sysctl -qw net.ipv4.tcp_wmem="4096 65536 4194304"
+            sysctl -qw net.ipv4.tcp_limit_output_bytes=1048576
+            ;;
+    esac
+    echo "  TCP tuning: $tier"
+}
+
+set_offload() {
+    want="$1"
+    current=$(uci -q get mtkhnat.global.enable)
+    if [ "$current" != "$want" ]; then
+        uci set mtkhnat.global.enable="$want"
+        uci commit mtkhnat
+        echo "  Hardware offload: $([ "$want" = "1" ] && echo "ON" || echo "OFF")"
+    fi
+}
+
+set_mtu() {
+    want="$1"
+    current=$(uci -q get network.wan.mtu)
+    if [ "$current" != "$want" ]; then
+        uci set network.wan.mtu="$want"
+        uci commit network
+        ifconfig eth0 mtu "$want" 2>/dev/null
+        echo "  WAN MTU: $current -> $want"
+    fi
+}
+
+detect_country() {
+    curl -s --max-time 5 http://ip-api.com/line/?fields=countryCode 2>/dev/null
+}
+
+check_internet() {
+    ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && return 0
+    ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1
+}
+
+# True when the repeater daemon answers ubus -- a quick liveness probe.
+repeater_running() {
+    ubus -t 3 call repeater status >/dev/null 2>&1
+}
+
+# Bring the repeater daemon up if it isn't already. Returns non-zero if it
+# still won't answer ubus after starting (caller decides how loud to be).
+ensure_repeater() {
+    repeater_running && return 0
+    /etc/init.d/repeater enable
+    /etc/init.d/repeater start
+    sleep 3
+    repeater_running
+}
+
+# List nearby networks via the repeater daemon survey, strongest first,
+# one line per ssid+band. Auth shown for info only -- repeater connect
+# auto-detects encryption, only ssid+key are needed to join.
+scan_networks() {
+    ensure_repeater || true
+    echo "  Scanning..."
+    survey=$(ubus -t 30 call repeater scan '{"cached":false}' 2>/dev/null) || {
+        echo "  Scan failed (repeater daemon not responding). Check: logread | grep repeater"
+        return 1
+    }
+    list=$(echo "$survey" \
+        | jsonfilter -e '@.survey[*]' 2>/dev/null \
+        | while read -r net; do
+            ssid=$(echo "$net" | jsonfilter -e '@.ssid' 2>/dev/null) || true
+            [ -z "$ssid" ] && continue
+            sig=$(echo "$net" | jsonfilter -e '@.signal' 2>/dev/null) || true
+            band=$(echo "$net" | jsonfilter -e '@.band' 2>/dev/null) || true
+            ch=$(echo "$net" | jsonfilter -e '@.channel' 2>/dev/null) || true
+            if echo "$net" | grep -q '"SAE"'; then
+                auth="WPA3"; echo "$net" | grep -q '"PSK"' && auth="WPA2/3"
+            elif echo "$net" | grep -q '"PSK"'; then auth="WPA2"
+            elif echo "$net" | grep -qE '"PRIVACY": ?true'; then auth="other"
+            else auth="open"; fi
+            printf "%s\t%s\t%s\t%s\t%s\n" "${sig:--99}" "$ssid" "${band:-?}" "${ch:-?}" "$auth"
+        done \
+        | sort -rn \
+        | awk -F"\t" '!seen[$2"/"$3]++ { printf "  %-30s %-4s ch %-4s %4s dBm  %s\n", $2, $3, $4, $1, $5 }') || true
+
+    if [ -n "$list" ]; then
+        echo "$list"
+    else
+        echo "  No networks found."
+    fi
+
+    # a disabled radio cannot scan, so its band silently vanishes from the list
+    if [ "$(uci -q get wireless.mt798111.disabled)" = "1" ]; then
+        echo "  NOTE: 2.4GHz radio is disabled; 2g networks not shown. Enable:"
+        echo "    uci set wireless.mt798111.disabled='0' && uci commit wireless && wifi reload"
+    fi
+}
+
+# Interactive helper: no uplink, walk the user through connecting one.
+offer_uplink() {
+    echo ""
+    echo "  No uplink detected. Connect one:"
+    echo "    - plug in ethernet WAN, then press Enter"
+    echo "    - type w to join a WiFi network"
+    echo "    - type q to quit"
+    printf "  > "
+    read -r answer
+    case "$answer" in
+        q|Q) return 1 ;;
+        w|W)
+            scan_networks
+            printf "  SSID: "; read -r w_ssid
+            printf "  Key:  "; read -r w_key
+            do_wifi "$w_ssid" "$w_key" || return 1
+            ;;
+    esac
+    echo "  Checking connectivity..."
+    i=0
+    while [ "$i" -lt 6 ]; do
+        if check_internet; then
+            echo "  Online."
+            return 0
+        fi
+        sleep 3
+        i=$((i+1))
+    done
+    echo "  Still no internet after 18s."
+    return 1
+}
+
+# Gate for commands that need internet. Interactive: offer to connect.
+require_internet() {
+    check_internet && return 0
+    echo "  No internet (1.1.1.1 and 8.8.8.8 unreachable)."
+    if [ -t 0 ]; then
+        offer_uplink
+    else
+        echo "  Check the uplink: plug ethernet WAN, or join WiFi:"
+        echo "    setup-link wifi <ssid> <key>"
+        return 1
+    fi
+}
+
+save_state() {
+    echo "$*" > "$STATE_FILE"
+}
+
+# --- speed test core (returns DL_MBPS, UL_MBPS via globals) ---
+
+run_speedtest() {
+    require_internet || return 1
+
+    if [ "$(uci -q get sqm.eth0.enabled)" = "1" ]; then
+        SQM_WAS_ENABLED="1"
+        echo "  Pausing SQM for accurate measurement..."
+        /etc/init.d/sqm stop 2>/dev/null
+    fi
+
+    echo "  Running Ookla speedtest..."
+    RAW=$(speedtest --accept-license --accept-gdpr -f json 2>/dev/null)
+
+    if [ -z "$RAW" ]; then
+        echo "  Speedtest failed."
+        restore_sqm
+        return 1
+    fi
+
+    DL_BPS=$(echo "$RAW" | grep -o '"download":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
+    UL_BPS=$(echo "$RAW" | grep -o '"upload":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
+
+    # An unparseable result must fail loudly: 0.0 Mbps would otherwise be
+    # applied as an SQM rate and persisted for replay at every boot.
+    if [ -z "$DL_BPS" ] || [ -z "$UL_BPS" ]; then
+        echo "  Could not parse speedtest output."
+        restore_sqm
+        return 1
+    fi
+    PING=$(echo "$RAW" | grep -o '"ping":{[^}]*}' | grep -o '"latency":[0-9.]*' | cut -d: -f2)
+    SERVER=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+    LOCATION=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"location":"[^"]*"' | cut -d'"' -f4)
+    ISP=$(echo "$RAW" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
+    URL=$(echo "$RAW" | grep -o '"url":"[^"]*"' | tail -1 | cut -d'"' -f4)
+
+    DL_MBPS=$(echo "$DL_BPS" | awk '{printf "%.1f", ($1 * 8) / 1000000}')
+    UL_MBPS=$(echo "$UL_BPS" | awk '{printf "%.2f", ($1 * 8) / 1000000}')
+
+    echo "  Server:   $SERVER ($LOCATION)"
+    echo "  ISP:      $ISP"
+    echo "  Ping:     ${PING}ms"
+    echo "  Download: ${DL_MBPS} Mbps"
+    echo "  Upload:   ${UL_MBPS} Mbps"
+    [ -n "$URL" ] && echo "  Result:   $URL"
+
+    restore_sqm
+}
+
+restore_sqm() {
+    if [ -n "$SQM_WAS_ENABLED" ]; then
+        /etc/init.d/sqm start 2>/dev/null
+        SQM_WAS_ENABLED=""
+    fi
+}
+
+# --- commands ---
+
+do_status() {
+    echo "=== SQM ==="
+    if [ "$(uci -q get sqm.eth0.enabled)" = "1" ]; then
+        echo "  Enabled: yes"
+        echo "  Download: $(uci -q get sqm.eth0.download) kbps"
+        echo "  Upload:   $(uci -q get sqm.eth0.upload) kbps"
+        echo "  Linklayer: $(uci -q get sqm.eth0.linklayer)"
+        echo "  Overhead:  $(uci -q get sqm.eth0.overhead)"
+        echo "  Egress:    $(uci -q get sqm.eth0.eqdisc_opts)"
+        echo "  Ingress:   $(uci -q get sqm.eth0.iqdisc_opts)"
+    else
+        echo "  Enabled: no"
+    fi
+    echo ""
+    echo "=== Hardware Offload ==="
+    echo "  mtkhnat: $([ "$(uci -q get mtkhnat.global.enable)" = "1" ] && echo "ON" || echo "OFF")"
+    echo ""
+    echo "=== Network ==="
+    echo "  WAN MTU: $(uci -q get network.wan.mtu || echo "1500")"
+    echo ""
+    echo "=== TCP Tuning ==="
+    echo "  tcp_rmem: $(sysctl -n net.ipv4.tcp_rmem)"
+    echo "  tcp_wmem: $(sysctl -n net.ipv4.tcp_wmem)"
+    echo "  tcp_limit_output_bytes: $(sysctl -n net.ipv4.tcp_limit_output_bytes)"
+    echo ""
+    echo "=== Wireless ==="
+    echo "  Country: $(uci -q get wireless.mt798112.country)"
+    echo "  Channel: $(uci -q get wireless.mt798112.channel)"
+    echo "  5GHz SSID: $(uci -q get wireless.wifi5g.ssid)"
+    echo ""
+    echo "=== Link ==="
+    ping -c 3 -W 2 8.8.8.8 2>/dev/null | tail -1
+}
+
+do_test() {
+    echo "=== Speed Test ==="
+    run_speedtest || return 1
+
+    echo ""
+    dl_kbps=$(echo "$DL_MBPS" | awk '{printf "%d", $1 * 1000}')
+
+    if [ "$dl_kbps" -gt 100000 ]; then
+        echo "=== Recommendation ==="
+        echo "  Link > 100 Mbps: no SQM needed, use hardware offload"
+        echo "  Run: setup-link off"
+    elif [ "$dl_kbps" -gt 50000 ]; then
+        echo "=== Recommendation ==="
+        echo "  Link 50-100 Mbps: SQM at 92%"
+        echo "  Run: setup-link apply $DL_MBPS $UL_MBPS ethernet"
+    else
+        echo "=== Recommendation ==="
+        echo "  Link < 50 Mbps: SQM at 85%"
+        echo "  Run: setup-link apply $DL_MBPS $UL_MBPS ethernet"
+        echo "  (use 'dsl' instead of 'ethernet' if on a DSL line)"
+    fi
+}
+
+do_apply() {
+    dl_mbps="$1"
+    ul_mbps="$2"
+    linktype="${3:-ethernet}"
+
+    if [ -z "$dl_mbps" ] || [ -z "$ul_mbps" ]; then
+        echo "Usage: setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]"
+        exit 1
+    fi
+
+    dl_kbps=$(echo "$dl_mbps" | awk '{printf "%d", $1 * 1000}')
+    ul_kbps=$(echo "$ul_mbps" | awk '{printf "%d", $1 * 1000}')
+
+    if [ "$dl_kbps" -gt 100000 ]; then
+        echo "Link > 100 Mbps: disabling SQM, enabling hardware offload"
+        do_off
+        return
+    elif [ "$dl_kbps" -gt 50000 ]; then
+        pct="0.92"
+        echo "Link 50-100 Mbps: SQM at 92%"
+        tune_tcp medium
+    else
+        pct="0.85"
+        echo "Link < 50 Mbps: SQM at 85%"
+        tune_tcp slow
+    fi
+
+    set_offload 0
+
+    sqm_dl=$(echo "$dl_kbps $pct" | awk '{printf "%d", $1 * $2}')
+    sqm_ul=$(echo "$ul_kbps $pct" | awk '{printf "%d", $1 * $2}')
+
+    if [ "$linktype" = "dsl" ]; then
+        linklayer="atm"
+        overhead="40"
+        script="layer_cake.qos"
+        eqdisc_opts="ack-filter-aggressive nat diffserv4 nowash split-gso rtt 50ms"
+        iqdisc_opts="nat ingress diffserv4 wash split-gso rtt 50ms"
+        set_mtu 1450
+    else
+        linklayer="ethernet"
+        overhead="34"
+        script="layer_cake.qos"
+        eqdisc_opts="nat diffserv4 nowash split-gso rtt 50ms"
+        iqdisc_opts="nat ingress diffserv4 wash split-gso rtt 50ms"
+        set_mtu 1500
+    fi
+
+    echo "  SQM: ${sqm_dl}/${sqm_ul} kbps, ${linklayer}, overhead ${overhead}"
+
+    uci set sqm.eth0.enabled='1'
+    uci set sqm.eth0.interface='eth0'
+    uci set sqm.eth0.qdisc='cake'
+    uci set sqm.eth0.script="$script"
+    uci set sqm.eth0.download="$sqm_dl"
+    uci set sqm.eth0.upload="$sqm_ul"
+    uci set sqm.eth0.linklayer="$linklayer"
+    uci set sqm.eth0.overhead="$overhead"
+    uci set sqm.eth0.eqdisc_opts="$eqdisc_opts"
+    uci set sqm.eth0.iqdisc_opts="$iqdisc_opts"
+    uci commit sqm
+    /etc/init.d/sqm restart
+
+    save_state apply "$dl_mbps" "$ul_mbps" "$linktype"
+    echo "Done."
+}
+
+do_off() {
+    echo "Disabling SQM..."
+    uci set sqm.eth0.enabled='0'
+    uci commit sqm
+    /etc/init.d/sqm stop 2>/dev/null
+
+    set_offload 1
+    set_mtu 1500
+    tune_tcp fast
+
+    save_state off
+    echo "Done."
+}
+
+do_wifi() {
+    ssid="$1"
+    key="$2"
+
+    if [ -z "$ssid" ]; then
+        echo "=== Repeater ==="
+        if ! ubus -t 3 call repeater status 2>/dev/null; then
+            echo "  Daemon not running. Join a network to start it:"
+            echo "  setup-link wifi <ssid> <key>"
+            return 0
+        fi
+        echo ""
+        echo "=== Nearby Networks ==="
+        scan_networks
+        return 0
+    fi
+
+    if [ -z "$key" ]; then
+        echo "Usage: setup-link wifi <ssid> <key>"
+        exit 1
+    fi
+
+    # disabled=1 (web UI toggle) kills the daemon, which also removes the
+    # ubus repeater API. Re-enable + start before trying to connect.
+    if [ "$(uci -q get repeater.@main[0].disabled)" = "1" ]; then
+        uci set repeater.@main[0].disabled='0'
+        uci commit repeater
+        echo "  Repeater was disabled in config: re-enabled"
+    fi
+    if ! repeater_running; then
+        if ensure_repeater; then
+            echo "  Repeater daemon started"
+        else
+            echo "  Repeater daemon failed to start. Check: logread | grep repeater"
+            return 1
+        fi
+    fi
+
+    echo "  Connecting to $ssid..."
+    if ! ubus call repeater connect "{\"ssid\":\"$ssid\",\"key\":\"$key\"}"; then
+        echo "  Connect call rejected (bad ssid/key format?)"
+        return 1
+    fi
+
+    i=0
+    while [ "$i" -lt 12 ]; do
+        sleep 5
+        i=$((i+1))
+        status=$(ubus call repeater status 2>/dev/null) || true
+        state=$(echo "$status" | grep -o '"state_s": *"[^"]*"' | cut -d'"' -f4) || true
+        fail=$(echo "$status" | grep -o '"fail_type": *"[^"]*"' | cut -d'"' -f4) || true
+
+        if [ "$state" = "connected" ]; then
+            signal=$(echo "$status" | grep -o '"signal": *-*[0-9]*' | grep -oE '\-?[0-9]+$') || true
+            channel=$(echo "$status" | grep -o '"channel": *[0-9]*' | grep -oE '[0-9]+$') || true
+            band="2.4GHz"; [ "${channel:-0}" -gt 14 ] && band="5GHz"
+            echo "  Connected: $ssid (channel $channel $band, ${signal} dBm)"
+            echo "  Note: with auto=2, ethernet WAN stays primary while plugged in."
+            return 0
+        fi
+        if [ -n "$fail" ]; then
+            echo "  Failed: $fail"
+            echo "  Recent log:"
+            logread | grep -iE "repeater|apcli" | tail -5
+            return 1
+        fi
+    done
+    echo "  Timed out after 60s (state: ${state:-unknown})"
+    return 1
+}
+
+do_country() {
+    cc="$1"
+    current=$(uci -q get wireless.mt798112.country)
+
+    if [ -z "$cc" ]; then
+        detected=$(detect_country)
+        echo "  Current:  $current"
+        if [ -n "$detected" ]; then
+            echo "  Detected: $detected (based on WAN IP)"
+            if [ "$current" = "$detected" ]; then
+                echo "  Already correct."
+                return 0
+            fi
+            if [ -t 0 ]; then
+                printf "  Set to $detected? [Y/n] "
+                read -r answer
+                case "$answer" in
+                    n|N) return 1 ;;
+                    *) cc="$detected" ;;
+                esac
+            else
+                echo "  Run: setup-link country $detected"
+                return 1
+            fi
+        else
+            echo "  Could not detect (no internet?)"
+            return 1
+        fi
+    fi
+
+    cc=$(echo "$cc" | tr '[:lower:]' '[:upper:]')
+
+    if [ "$current" = "$cc" ]; then
+        echo "  Country already set to $cc."
+        return 0
+    fi
+
+    echo "  Country: $current -> $cc"
+    uci set wireless.mt798111.country="$cc"
+    uci set wireless.mt798112.country="$cc"
+    uci commit wireless
+
+    # Return 2 to signal "needs reboot"
+    return 2
+}
+
+do_arrive() {
+    echo "=== New Location Setup ==="
+    echo ""
+
+    # Step 0: Uplink (country detection and speed test both need internet)
+    require_internet || return 1
+    echo ""
+
+    # Step 1: Country
+    echo "--- Country ---"
+    country_rc=0
+    do_country || country_rc=$?
+
+    if [ "$country_rc" -eq 2 ]; then
+        # Country changed, needs reboot before speed test
+        echo ""
+        echo "  Country changed. Reboot needed for WiFi channels."
+        echo "  After reboot, run: setup-link arrive"
+        echo ""
+        if [ -t 0 ]; then
+            printf "  Reboot now? [Y/n] "
+            read -r answer
+            case "$answer" in
+                n|N) echo "  Run 'reboot' when ready, then 'setup-link arrive' again." ;;
+                *) echo "  Rebooting..."; reboot ;;
+            esac
+        else
+            echo "  Reboot to continue: reboot && setup-link arrive"
+        fi
+        return
+    fi
+
+    echo ""
+
+    # Step 2: Speed test + auto-apply
+    echo "--- Speed Test ---"
+    run_speedtest || true
+    if [ -z "${DL_MBPS:-}" ]; then
+        echo "  Speedtest failed. Use 'setup-link apply <down> <up> [dsl|ethernet]' manually."
+        return 1
+    fi
+
+    dl_kbps=$(echo "$DL_MBPS" | awk '{printf "%d", $1 * 1000}')
+
+    echo ""
+    echo "--- Applying ---"
+
+    # Detect uplink type from default route device
+    wan_dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
+    case "$wan_dev" in
+        apcli*) uplink="repeater" ;;
+        *)      uplink="ethernet" ;;
+    esac
+    echo "  Uplink: $uplink (via $wan_dev)"
+
+    if [ "$dl_kbps" -gt 100000 ]; then
+        echo "  Link > 100 Mbps: hardware offload, no SQM"
+        do_off
+    else
+        linktype="ethernet"
+        # Only ask about DSL for wired connections -- repeater is never DSL
+        if [ "$uplink" = "ethernet" ] && [ -t 0 ]; then
+            printf "  DSL uplink? [y/N] "
+            read -r answer
+            case "$answer" in
+                y|Y) linktype="dsl" ;;
+            esac
+        fi
+        do_apply "$DL_MBPS" "$UL_MBPS" "$linktype"
+    fi
+
+    echo ""
+    echo "=== Done ==="
+    ping -c 3 -W 2 8.8.8.8 2>/dev/null | tail -1
+}
+
+do_boot() {
+    if [ ! -f "$STATE_FILE" ]; then
+        echo "No saved state. Run 'setup-link arrive' first."
+        return 0
+    fi
+    saved=$(cat "$STATE_FILE")
+    echo "Restoring: setup-link $saved"
+    # shellcheck disable=SC2086
+    set -- $saved
+    cmd="$1"; shift
+    case "$cmd" in
+        apply) do_apply "$@" ;;
+        off)   do_off ;;
+    esac
+}
+
+# --- main ---
+
+case "$1" in
+    arrive)
+        do_arrive
+        ;;
+    boot)
+        do_boot
+        ;;
+    test)
+        do_test
+        ;;
+    apply)
+        do_apply "$2" "$3" "$4"
+        ;;
+    off)
+        do_off
+        ;;
+    wifi)
+        do_wifi "$2" "$3"
+        ;;
+    country)
+        rc=0
+        do_country "$2" || rc=$?
+        if [ "$rc" -eq 2 ] && [ -t 0 ]; then
+            printf "Reboot now to apply? [y/N] "
+            read -r answer
+            case "$answer" in
+                y|Y) echo "Rebooting..."; reboot ;;
+                *) echo "Reboot later: reboot" ;;
+            esac
+        elif [ "$rc" -eq 2 ]; then
+            echo "Reboot to apply: reboot"
+        fi
+        ;;
+    status)
+        do_status
+        ;;
+    *)
+        echo "setup-link: Configure SQM, offload, MTU, and TCP for GL-MT3000"
+        echo ""
+        echo "New location? Just run:"
+        echo "  setup-link arrive                                   Auto-detect, test, configure"
+        echo ""
+        echo "Manual control:"
+        echo "  setup-link test                                     Speed test + suggestions"
+        echo "  setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]  Apply SQM"
+        echo "  setup-link apply 8.6 0.75 dsl                      Example: ADSL line"
+        echo "  setup-link apply 50 20 ethernet                    Example: hotel WiFi"
+        echo "  setup-link off                                      Fast link: HW offload, no SQM"
+        echo "  setup-link wifi <ssid> <key>                        Join WiFi as repeater uplink"
+        echo "  setup-link wifi                                     Repeater status + scan nearby"
+        echo "  setup-link country                                  Auto-detect country from WAN IP"
+        echo "  setup-link country FR                               Set WiFi country manually"
+        echo "  setup-link status                                   Show current config"
+        echo "  setup-link boot                                     Replay last config (used by init)"
+        echo ""
+        echo "What each mode configures:"
+        echo "  apply (dsl):      SQM on, offload off, MTU 1450, ATM overhead, tight TCP buffers"
+        echo "  apply (ethernet): SQM on, offload off, MTU 1500, ethernet overhead, tight TCP buffers"
+        echo "  off:              SQM off, offload on, MTU 1500, large TCP buffers"
+        echo ""
+        echo "Config persists across reboots via /etc/setup-link.last"
+        ;;
+esac
