@@ -65,6 +65,20 @@ detect_country() {
     curl -s --max-time 5 http://ip-api.com/line/?fields=countryCode 2>/dev/null
 }
 
+detect_timezone() {
+    curl -s --max-time 5 http://ip-api.com/line/?fields=timezone 2>/dev/null
+}
+
+# LuCI ships the canonical IANA -> POSIX timezone map; use it so the clock gets
+# real DST rules (America/Toronto -> EST5EDT,M3.2.0,M11.1.0) instead of a bare
+# offset that would not follow daylight saving.
+TZDATA_LUA="/usr/lib/lua/luci/sys/zoneinfo/tzdata.lua"
+posix_for_zone() {
+    # tzdata.lua lines look like:  { 'America/Toronto', 'EST5EDT,M3.2.0,M11.1.0' },
+    [ -f "$TZDATA_LUA" ] || return 1
+    awk -F"'" -v z="$1" '$2 == z { print $4; exit }' "$TZDATA_LUA"
+}
+
 check_internet() {
     ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && return 0
     ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1
@@ -488,6 +502,38 @@ do_country() {
     return 2
 }
 
+do_timezone() {
+    zone="$1"
+
+    if [ -z "$zone" ]; then
+        zone=$(detect_timezone)
+        if [ -z "$zone" ]; then
+            echo "  Could not detect timezone (no internet?)"
+            return 1
+        fi
+        echo "  Detected: $zone (based on WAN IP)"
+    fi
+
+    posix=$(posix_for_zone "$zone")
+    if [ -z "$posix" ]; then
+        echo "  No POSIX mapping for '$zone'; leaving timezone unchanged."
+        return 1
+    fi
+
+    current=$(uci -q get system.@system[0].zonename)
+    if [ "$current" = "$zone" ]; then
+        echo "  Timezone already set to $zone."
+        return 0
+    fi
+
+    echo "  Timezone: ${current:-UTC} -> $zone ($posix)"
+    uci set system.@system[0].zonename="$zone"
+    uci set system.@system[0].timezone="$posix"
+    uci commit system
+    /etc/init.d/system reload 2>/dev/null || true
+    return 0
+}
+
 do_arrive() {
     echo "=== New Location Setup ==="
     echo ""
@@ -520,6 +566,11 @@ do_arrive() {
         return
     fi
 
+    echo ""
+
+    # Step 1b: Timezone (same WAN-IP geolocation basis as country)
+    echo "--- Timezone ---"
+    do_timezone || true
     echo ""
 
     # Step 2: Speed test + auto-apply
@@ -615,6 +666,9 @@ case "$1" in
             echo "Reboot to apply: reboot"
         fi
         ;;
+    timezone|tz)
+        do_timezone "$2" || true
+        ;;
     status)
         do_status
         ;;
@@ -634,6 +688,8 @@ case "$1" in
         echo "  setup-link wifi                                     Repeater status + scan nearby"
         echo "  setup-link country                                  Auto-detect country from WAN IP"
         echo "  setup-link country FR                               Set WiFi country manually"
+        echo "  setup-link timezone                                 Auto-detect timezone from WAN IP"
+        echo "  setup-link timezone Europe/Paris                    Set timezone manually"
         echo "  setup-link status                                   Show current config"
         echo "  setup-link boot                                     Replay last config (used by init)"
         echo ""
