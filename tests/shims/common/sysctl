@@ -1,0 +1,6 @@
+#!/bin/sh
+# Records writes; answers reads with a fixed value.
+case "$1" in
+    -qw | -w) echo "$2" >> "${SYSCTL_LOG:?}" ;;
+    -n) echo "4096 131072 1048576" ;;
+esac

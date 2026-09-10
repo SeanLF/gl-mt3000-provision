@@ -5,7 +5,7 @@
 #
 # Manual control:
 #   setup-link test                                     Speed test + suggestions
-#   setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]  Apply SQM config
+#   setup-link apply <down_mbps> <up_mbps> [ethernet|dsl|docsis]  Apply SQM config
 #   setup-link off                                      Fast link: HW offload, no SQM
 #   setup-link wifi <ssid> <key>                        Join WiFi as repeater uplink
 #   setup-link country [CC]                             Set/detect WiFi country code
@@ -14,12 +14,20 @@
 set -e
 
 SQM_WAS_ENABLED=""
-STATE_FILE="/etc/setup-link.last"
+STATE_FILE="${SETUP_LINK_STATE:-/etc/setup-link.last}"
+SQM_INIT="${SETUP_LINK_SQM_INIT:-/etc/init.d/sqm}"
+
+# Shaping decision. Below 100 Mbps CAKE always pays for itself. Above it, the
+# question is whether the link bloats: measure ping under load and shape only if
+# it does. Above CAKE_MAX_KBPS the MT3000 CPU is the bottleneck, so run unshaped.
+BLOAT_OK_MS=10       # loaded-minus-idle avg ping at or below this = clean unshaped
+CAKE_MAX_KBPS=300000 # rough CAKE ceiling on the mt7981 without hardware offload
+LATENCY_TARGET="${SETUP_LINK_LATENCY_TARGET:-1.1.1.1}"
 
 # --- helpers ---
 
 tune_tcp() {
-    tier="$1"  # slow (<50M), medium (50-100M), fast (>100M)
+    tier="$1" # slow (<50M), medium (50-100M), fast (>100M)
     case "$tier" in
         slow)
             sysctl -qw net.ipv4.tcp_rmem="4096 32768 524288"
@@ -72,7 +80,7 @@ detect_timezone() {
 # LuCI ships the canonical IANA -> POSIX timezone map; use it so the clock gets
 # real DST rules (America/Toronto -> EST5EDT,M3.2.0,M11.1.0) instead of a bare
 # offset that would not follow daylight saving.
-TZDATA_LUA="/usr/lib/lua/luci/sys/zoneinfo/tzdata.lua"
+TZDATA_LUA="${SETUP_LINK_TZDATA:-/usr/lib/lua/luci/sys/zoneinfo/tzdata.lua}"
 posix_for_zone() {
     # tzdata.lua lines look like:  { 'America/Toronto', 'EST5EDT,M3.2.0,M11.1.0' },
     [ -f "$TZDATA_LUA" ] || return 1
@@ -109,23 +117,26 @@ scan_networks() {
         echo "  Scan failed (repeater daemon not responding). Check: logread | grep repeater"
         return 1
     }
-    list=$(echo "$survey" \
-        | jsonfilter -e '@.survey[*]' 2>/dev/null \
-        | while read -r net; do
+    list=$(echo "$survey" |
+        jsonfilter -e '@.survey[*]' 2>/dev/null |
+        while read -r net; do
             ssid=$(echo "$net" | jsonfilter -e '@.ssid' 2>/dev/null) || true
             [ -z "$ssid" ] && continue
             sig=$(echo "$net" | jsonfilter -e '@.signal' 2>/dev/null) || true
             band=$(echo "$net" | jsonfilter -e '@.band' 2>/dev/null) || true
             ch=$(echo "$net" | jsonfilter -e '@.channel' 2>/dev/null) || true
             if echo "$net" | grep -q '"SAE"'; then
-                auth="WPA3"; echo "$net" | grep -q '"PSK"' && auth="WPA2/3"
-            elif echo "$net" | grep -q '"PSK"'; then auth="WPA2"
-            elif echo "$net" | grep -qE '"PRIVACY": ?true'; then auth="other"
+                auth="WPA3"
+                echo "$net" | grep -q '"PSK"' && auth="WPA2/3"
+            elif echo "$net" | grep -q '"PSK"'; then
+                auth="WPA2"
+            elif echo "$net" | grep -qE '"PRIVACY": ?true'; then
+                auth="other"
             else auth="open"; fi
             printf "%s\t%s\t%s\t%s\t%s\n" "${sig:--99}" "$ssid" "${band:-?}" "${ch:-?}" "$auth"
-        done \
-        | sort -rn \
-        | awk -F"\t" '!seen[$2"/"$3]++ { printf "  %-30s %-4s ch %-4s %4s dBm  %s\n", $2, $3, $4, $1, $5 }') || true
+        done |
+        sort -rn |
+        awk -F"\t" '!seen[$2"/"$3]++ { printf "  %-30s %-4s ch %-4s %4s dBm  %s\n", $2, $3, $4, $1, $5 }') || true
 
     if [ -n "$list" ]; then
         echo "$list"
@@ -150,11 +161,13 @@ offer_uplink() {
     printf "  > "
     read -r answer
     case "$answer" in
-        q|Q) return 1 ;;
-        w|W)
+        q | Q) return 1 ;;
+        w | W)
             scan_networks
-            printf "  SSID: "; read -r w_ssid
-            printf "  Key:  "; read -r w_key
+            printf "  SSID: "
+            read -r w_ssid
+            printf "  Key:  "
+            read -r w_key
             do_wifi "$w_ssid" "$w_key" || return 1
             ;;
     esac
@@ -166,7 +179,7 @@ offer_uplink() {
             return 0
         fi
         sleep 3
-        i=$((i+1))
+        i=$((i + 1))
     done
     echo "  Still no internet after 18s."
     return 1
@@ -186,10 +199,91 @@ require_internet() {
 }
 
 save_state() {
-    echo "$*" > "$STATE_FILE"
+    echo "$*" >"$STATE_FILE"
 }
 
-# --- speed test core (returns DL_MBPS, UL_MBPS via globals) ---
+# --- latency under load ---
+
+# "avg max" ping in ms over $1 samples $2 ms apart to LATENCY_TARGET; empty on
+# failure. fping ships from firmware 4.11; busybox ping is the fallback.
+ping_stats() {
+    if command -v fping >/dev/null 2>&1; then
+        fping -c "$1" -p "$2" -q "$LATENCY_TARGET" 2>&1
+    else
+        ping -c "$1" -W 2 "$LATENCY_TARGET" 2>/dev/null | tail -1
+    fi | sed -n 's#.*min/avg/max = [0-9.]*/\([0-9.]*\)/\([0-9.]*\).*#\1 \2#p'
+}
+
+# Run "$@" (stdout to file $1) while sampling ping; sets LOADED_MS/LOADED_MAX_MS.
+# Sampling starts a second in so the transfer is already saturating.
+under_load() {
+    out="$1"
+    shift
+    stats=$(mktemp)
+    (
+        sleep 1
+        ping_stats 8 1000 >"$stats"
+    ) &
+    pinger=$!
+    "$@" >"$out" 2>/dev/null
+    rc=$?
+    wait "$pinger"
+    # shellcheck disable=SC2046
+    set -- $(cat "$stats")
+    LOADED_MS="${1:-}"
+    rm -f "$stats"
+    return $rc
+}
+
+# BLOAT_MS = worst loaded avg minus idle avg, whole ms; empty if unmeasured.
+compute_bloat() {
+    BLOAT_MS=""
+    [ -n "${IDLE_MS:-}" ] || return 0
+    worst=""
+    for v in "${LOADED_DL_MS:-}" "${LOADED_UL_MS:-}"; do
+        [ -n "$v" ] || continue
+        [ -z "$worst" ] && worst="$v"
+        worst=$(echo "$worst $v" | awk '{ print ($2 > $1) ? $2 : $1 }')
+    done
+    [ -n "$worst" ] || return 0
+    BLOAT_MS=$(echo "$worst $IDLE_MS" | awk '{ d = $1 - $2; if (d < 0) d = 0; printf "%d", d + 0.5 }')
+}
+
+# Prints "off" or "apply" for a measured link; see the constants at the top.
+decide_mode() {
+    dl="$1"
+    if [ "$dl" -gt "$CAKE_MAX_KBPS" ]; then
+        echo off
+    elif [ "$dl" -gt 100000 ] && [ -n "${BLOAT_MS:-}" ] && [ "$BLOAT_MS" -le "$BLOAT_OK_MS" ]; then
+        echo off
+    elif [ "$dl" -gt 100000 ] && [ -z "${BLOAT_MS:-}" ]; then
+        echo off
+    else
+        echo apply
+    fi
+}
+
+explain_decision() {
+    dl="$1"
+    if [ -n "${BLOAT_MS:-}" ]; then
+        echo "  Bufferbloat: idle ${IDLE_MS} ms, loaded ${LOADED_DL_MS:-?} down / ${LOADED_UL_MS:-?} up (+${BLOAT_MS} ms)"
+    fi
+    if [ "$dl" -gt "$CAKE_MAX_KBPS" ]; then
+        echo "  Link > $((CAKE_MAX_KBPS / 1000)) Mbps: beyond CAKE on this CPU, run unshaped"
+    elif [ "$dl" -gt 100000 ] && [ -z "${BLOAT_MS:-}" ]; then
+        echo "  Link > 100 Mbps and latency under load unmeasured: run unshaped"
+    elif [ "$dl" -gt 100000 ] && [ "$BLOAT_MS" -le "$BLOAT_OK_MS" ]; then
+        echo "  Link > 100 Mbps and clean under load (+${BLOAT_MS} ms <= ${BLOAT_OK_MS}): no SQM needed"
+    elif [ "$dl" -gt 100000 ]; then
+        echo "  Link > 100 Mbps but bloats under load (+${BLOAT_MS} ms > ${BLOAT_OK_MS}): SQM at 92%"
+    elif [ "$dl" -gt 50000 ]; then
+        echo "  Link 50-100 Mbps: SQM at 92%"
+    else
+        echo "  Link < 50 Mbps: SQM at 85%"
+    fi
+}
+
+# --- speed test core (returns DL_MBPS, UL_MBPS, IDLE_MS, LOADED_*_MS via globals) ---
 
 run_speedtest() {
     require_internet || return 1
@@ -197,11 +291,29 @@ run_speedtest() {
     if [ "$(uci -q get sqm.eth0.enabled)" = "1" ]; then
         SQM_WAS_ENABLED="1"
         echo "  Pausing SQM for accurate measurement..."
-        /etc/init.d/sqm stop 2>/dev/null
+        "$SQM_INIT" stop 2>/dev/null
+    fi
+
+    # 4.11+ ships gl_speedtest (Cloudflare, nearest PoP, no server roulette).
+    # Prefer it; fall back to the hand-copied Ookla CLI on older firmware.
+    if command -v gl_speedtest >/dev/null 2>&1; then
+        run_speedtest_cloudflare
+        return $?
     fi
 
     echo "  Running Ookla speedtest..."
-    RAW=$(speedtest --accept-license --accept-gdpr -f json 2>/dev/null)
+    # shellcheck disable=SC2046
+    set -- $(ping_stats 10 200)
+    IDLE_MS="${1:-}"
+    raw=$(mktemp)
+    under_load "$raw" speedtest --accept-license --accept-gdpr -f json || true
+    RAW=$(cat "$raw")
+    rm -f "$raw"
+    # Ookla runs both directions inside one process, so one loaded figure
+    # covers both.
+    LOADED_DL_MS="$LOADED_MS"
+    LOADED_UL_MS="$LOADED_MS"
+    compute_bloat
 
     if [ -z "$RAW" ]; then
         echo "  Speedtest failed."
@@ -230,7 +342,7 @@ run_speedtest() {
 
     echo "  Server:   $SERVER ($LOCATION)"
     echo "  ISP:      $ISP"
-    echo "  Ping:     ${PING}ms"
+    echo "  Ping:     ${PING}ms (idle ${IDLE_MS:-?} ms, loaded ${LOADED_MS:-?} ms)"
     echo "  Download: ${DL_MBPS} Mbps"
     echo "  Upload:   ${UL_MBPS} Mbps"
     [ -n "$URL" ] && echo "  Result:   $URL"
@@ -238,9 +350,64 @@ run_speedtest() {
     restore_sqm
 }
 
+# gl_speedtest args: bytes interval max_time connect_timeout concurrency.
+# max_time bounds the run, so a slow hotel link finishes in the same ~10 s as a
+# fast one. Output per phase: "idle ping avg N ms", samples, "loaded ping avg N
+# ms", "download average N Mbps", then the peak as "download N Mbps".
+# Last numeric value before "Mbps"/"ms" on the last line matching $1 in file $2.
+cf_value() {
+    awk -v k="$1" 'index($0, k) { v = $(NF - 1) } END { if (v ~ /^[0-9]+(\.[0-9]+)?$/) print v }' "$2"
+}
+
+# One gl_speedtest phase into file $3, retried once: a dropped connection to
+# the edge otherwise aborts the whole arrive.
+cf_phase() {
+    gl_speedtest "$1" "$2" 1.0 10 5 4 >"$3" 2>/dev/null || true
+    grep -q "$1 average" "$3" && return 0
+    echo "  $1 phase gave no result, retrying once..."
+    sleep 2
+    gl_speedtest "$1" "$2" 1.0 10 5 4 >"$3" 2>/dev/null || true
+}
+
+run_speedtest_cloudflare() {
+    echo "  Running Cloudflare speed test (gl_speedtest)..."
+    out=$(mktemp)
+    # Each phase prints its own idle/loaded ping and a run average; the final
+    # "download N" line is the peak, so the average is what gets shaped.
+    cf_phase download 268435456 "$out"
+    IDLE_MS=$(cf_value "idle ping avg" "$out")
+    LOADED_DL_MS=$(cf_value "loaded ping avg" "$out")
+    dl=$(cf_value "download average" "$out")
+    cf_phase upload 134217728 "$out"
+    # Each phase measures idle itself; a phase can print the line without a
+    # number when its probe fails, so take whichever phase has one.
+    [ -n "$IDLE_MS" ] || IDLE_MS=$(cf_value "idle ping avg" "$out")
+    LOADED_UL_MS=$(cf_value "loaded ping avg" "$out")
+    ul=$(cf_value "upload average" "$out")
+    rm -f "$out"
+    if [ -z "$IDLE_MS" ]; then
+        # shellcheck disable=SC2046
+        set -- $(ping_stats 10 200)
+        IDLE_MS="${1:-}"
+    fi
+    compute_bloat
+    if [ -z "$dl" ] || [ -z "$ul" ]; then
+        echo "  Speed test failed (gl_speedtest gave no result)."
+        restore_sqm
+        return 1
+    fi
+    DL_MBPS=$(echo "$dl" | awk '{ printf "%.1f", $1 }')
+    UL_MBPS=$(echo "$ul" | awk '{ printf "%.2f", $1 }')
+    echo "  Server:   speed.cloudflare.com (nearest PoP)"
+    echo "  Ping:     idle ${IDLE_MS:-?} ms, loaded ${LOADED_DL_MS:-?} ms down / ${LOADED_UL_MS:-?} ms up"
+    echo "  Download: ${DL_MBPS} Mbps (10 s average)"
+    echo "  Upload:   ${UL_MBPS} Mbps (10 s average)"
+    restore_sqm
+}
+
 restore_sqm() {
     if [ -n "$SQM_WAS_ENABLED" ]; then
-        /etc/init.d/sqm start 2>/dev/null
+        "$SQM_INIT" start 2>/dev/null
         SQM_WAS_ENABLED=""
     fi
 }
@@ -288,20 +455,20 @@ do_test() {
     echo ""
     dl_kbps=$(echo "$DL_MBPS" | awk '{printf "%d", $1 * 1000}')
 
-    if [ "$dl_kbps" -gt 100000 ]; then
-        echo "=== Recommendation ==="
-        echo "  Link > 100 Mbps: no SQM needed, use hardware offload"
+    echo "=== Recommendation ==="
+    explain_decision "$dl_kbps"
+    if [ "$(decide_mode "$dl_kbps")" = "off" ]; then
         echo "  Run: setup-link off"
-    elif [ "$dl_kbps" -gt 50000 ]; then
-        echo "=== Recommendation ==="
-        echo "  Link 50-100 Mbps: SQM at 92%"
-        echo "  Run: setup-link apply $DL_MBPS $UL_MBPS ethernet"
     else
-        echo "=== Recommendation ==="
-        echo "  Link < 50 Mbps: SQM at 85%"
-        echo "  Run: setup-link apply $DL_MBPS $UL_MBPS ethernet"
-        echo "  (use 'dsl' instead of 'ethernet' if on a DSL line)"
+        echo "  Run: setup-link apply $DL_MBPS $UL_MBPS $(last_linktype)"
+        echo "  (link type: 'ethernet' default, 'dsl' on ADSL, 'docsis' behind a cable modem)"
     fi
+}
+
+# Link type from the last apply, so re-runs at the same place keep it.
+last_linktype() {
+    lt=$(awk '$1 == "apply" { print $4 }' "$STATE_FILE" 2>/dev/null || true)
+    echo "${lt:-ethernet}"
 }
 
 do_apply() {
@@ -310,17 +477,21 @@ do_apply() {
     linktype="${3:-ethernet}"
 
     if [ -z "$dl_mbps" ] || [ -z "$ul_mbps" ]; then
-        echo "Usage: setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]"
+        echo "Usage: setup-link apply <down_mbps> <up_mbps> [ethernet|dsl|docsis]"
         exit 1
     fi
 
     dl_kbps=$(echo "$dl_mbps" | awk '{printf "%d", $1 * 1000}')
     ul_kbps=$(echo "$ul_mbps" | awk '{printf "%d", $1 * 1000}')
 
-    if [ "$dl_kbps" -gt 100000 ]; then
-        echo "Link > 100 Mbps: disabling SQM, enabling hardware offload"
+    if [ "$dl_kbps" -gt "$CAKE_MAX_KBPS" ]; then
+        echo "Link > $((CAKE_MAX_KBPS / 1000)) Mbps: beyond CAKE on this CPU, disabling SQM, enabling hardware offload"
         do_off
         return
+    elif [ "$dl_kbps" -gt 100000 ]; then
+        pct="0.92"
+        echo "Link > 100 Mbps: SQM at 92% (asked for explicitly; 'arrive' only shapes here when the link bloats)"
+        tune_tcp fast
     elif [ "$dl_kbps" -gt 50000 ]; then
         pct="0.92"
         echo "Link 50-100 Mbps: SQM at 92%"
@@ -343,6 +514,15 @@ do_apply() {
         eqdisc_opts="ack-filter-aggressive nat diffserv4 nowash split-gso rtt 50ms"
         iqdisc_opts="nat ingress diffserv4 wash split-gso rtt 50ms"
         set_mtu 1450
+    elif [ "$linktype" = "docsis" ]; then
+        # DOCSIS frames carry 18 bytes of overhead per packet (CAKE's own
+        # 'docsis' keyword); the generic 34 is safe but wastes ~1% on cable.
+        linklayer="ethernet"
+        overhead="18"
+        script="layer_cake.qos"
+        eqdisc_opts="nat diffserv4 nowash split-gso rtt 50ms"
+        iqdisc_opts="nat ingress diffserv4 wash split-gso rtt 50ms"
+        set_mtu 1500
     else
         linklayer="ethernet"
         overhead="34"
@@ -365,7 +545,7 @@ do_apply() {
     uci set sqm.eth0.eqdisc_opts="$eqdisc_opts"
     uci set sqm.eth0.iqdisc_opts="$iqdisc_opts"
     uci commit sqm
-    /etc/init.d/sqm restart
+    "$SQM_INIT" restart
 
     save_state apply "$dl_mbps" "$ul_mbps" "$linktype"
     echo "Done."
@@ -375,7 +555,7 @@ do_off() {
     echo "Disabling SQM..."
     uci set sqm.eth0.enabled='0'
     uci commit sqm
-    /etc/init.d/sqm stop 2>/dev/null
+    "$SQM_INIT" stop 2>/dev/null
 
     set_offload 1
     set_mtu 1500
@@ -432,7 +612,7 @@ do_wifi() {
     i=0
     while [ "$i" -lt 12 ]; do
         sleep 5
-        i=$((i+1))
+        i=$((i + 1))
         status=$(ubus call repeater status 2>/dev/null) || true
         state=$(echo "$status" | grep -o '"state_s": *"[^"]*"' | cut -d'"' -f4) || true
         fail=$(echo "$status" | grep -o '"fail_type": *"[^"]*"' | cut -d'"' -f4) || true
@@ -440,7 +620,8 @@ do_wifi() {
         if [ "$state" = "connected" ]; then
             signal=$(echo "$status" | grep -o '"signal": *-*[0-9]*' | grep -oE '\-?[0-9]+$') || true
             channel=$(echo "$status" | grep -o '"channel": *[0-9]*' | grep -oE '[0-9]+$') || true
-            band="2.4GHz"; [ "${channel:-0}" -gt 14 ] && band="5GHz"
+            band="2.4GHz"
+            [ "${channel:-0}" -gt 14 ] && band="5GHz"
             echo "  Connected: $ssid (channel $channel $band, ${signal} dBm)"
             echo "  Note: with auto=2, ethernet WAN stays primary while plugged in."
             return 0
@@ -473,7 +654,7 @@ do_country() {
                 printf "  Set to $detected? [Y/n] "
                 read -r answer
                 case "$answer" in
-                    n|N) return 1 ;;
+                    n | N) return 1 ;;
                     *) cc="$detected" ;;
                 esac
             else
@@ -557,8 +738,11 @@ do_arrive() {
             printf "  Reboot now? [Y/n] "
             read -r answer
             case "$answer" in
-                n|N) echo "  Run 'reboot' when ready, then 'setup-link arrive' again." ;;
-                *) echo "  Rebooting..."; reboot ;;
+                n | N) echo "  Run 'reboot' when ready, then 'setup-link arrive' again." ;;
+                *)
+                    echo "  Rebooting..."
+                    reboot
+                    ;;
             esac
         else
             echo "  Reboot to continue: reboot && setup-link arrive"
@@ -577,7 +761,7 @@ do_arrive() {
     echo "--- Speed Test ---"
     run_speedtest || true
     if [ -z "${DL_MBPS:-}" ]; then
-        echo "  Speedtest failed. Use 'setup-link apply <down> <up> [dsl|ethernet]' manually."
+        echo "  Speedtest failed. Use 'setup-link apply <down> <up> [ethernet|dsl|docsis]' manually."
         return 1
     fi
 
@@ -590,22 +774,26 @@ do_arrive() {
     wan_dev=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
     case "$wan_dev" in
         apcli*) uplink="repeater" ;;
-        *)      uplink="ethernet" ;;
+        *) uplink="ethernet" ;;
     esac
     echo "  Uplink: $uplink (via $wan_dev)"
 
-    if [ "$dl_kbps" -gt 100000 ]; then
-        echo "  Link > 100 Mbps: hardware offload, no SQM"
+    explain_decision "$dl_kbps"
+    if [ "$(decide_mode "$dl_kbps")" = "off" ]; then
         do_off
     else
-        linktype="ethernet"
-        # Only ask about DSL for wired connections -- repeater is never DSL
+        linktype=$(last_linktype)
+        # Only ask for wired connections -- a repeater uplink is never DSL or cable
         if [ "$uplink" = "ethernet" ] && [ -t 0 ]; then
-            printf "  DSL uplink? [y/N] "
+            printf "  Link type? [e]thernet / [d]sl / [c]able-docsis [%s]: " "$linktype"
             read -r answer
             case "$answer" in
-                y|Y) linktype="dsl" ;;
+                e | E) linktype="ethernet" ;;
+                d | D) linktype="dsl" ;;
+                c | C) linktype="docsis" ;;
             esac
+        elif [ "$uplink" = "repeater" ]; then
+            linktype="ethernet"
         fi
         do_apply "$DL_MBPS" "$UL_MBPS" "$linktype"
     fi
@@ -624,10 +812,11 @@ do_boot() {
     echo "Restoring: setup-link $saved"
     # shellcheck disable=SC2086
     set -- $saved
-    cmd="$1"; shift
+    cmd="$1"
+    shift
     case "$cmd" in
         apply) do_apply "$@" ;;
-        off)   do_off ;;
+        off) do_off ;;
     esac
 }
 
@@ -659,14 +848,17 @@ case "$1" in
             printf "Reboot now to apply? [y/N] "
             read -r answer
             case "$answer" in
-                y|Y) echo "Rebooting..."; reboot ;;
+                y | Y)
+                    echo "Rebooting..."
+                    reboot
+                    ;;
                 *) echo "Reboot later: reboot" ;;
             esac
         elif [ "$rc" -eq 2 ]; then
             echo "Reboot to apply: reboot"
         fi
         ;;
-    timezone|tz)
+    timezone | tz)
         do_timezone "$2" || true
         ;;
     status)
@@ -680,8 +872,9 @@ case "$1" in
         echo ""
         echo "Manual control:"
         echo "  setup-link test                                     Speed test + suggestions"
-        echo "  setup-link apply <down_mbps> <up_mbps> [dsl|ethernet]  Apply SQM"
+        echo "  setup-link apply <down_mbps> <up_mbps> [ethernet|dsl|docsis]  Apply SQM"
         echo "  setup-link apply 8.6 0.75 dsl                      Example: ADSL line"
+        echo "  setup-link apply 100 100 docsis                    Example: cable modem"
         echo "  setup-link apply 50 20 ethernet                    Example: hotel WiFi"
         echo "  setup-link off                                      Fast link: HW offload, no SQM"
         echo "  setup-link wifi <ssid> <key>                        Join WiFi as repeater uplink"
@@ -695,7 +888,8 @@ case "$1" in
         echo ""
         echo "What each mode configures:"
         echo "  apply (dsl):      SQM on, offload off, MTU 1450, ATM overhead, tight TCP buffers"
-        echo "  apply (ethernet): SQM on, offload off, MTU 1500, ethernet overhead, tight TCP buffers"
+        echo "  apply (ethernet): SQM on, offload off, MTU 1500, ethernet overhead 34, tight TCP buffers"
+        echo "  apply (docsis):   SQM on, offload off, MTU 1500, cable overhead 18, tight TCP buffers"
         echo "  off:              SQM off, offload on, MTU 1500, large TCP buffers"
         echo ""
         echo "Config persists across reboots via /etc/setup-link.last"

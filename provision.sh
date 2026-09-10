@@ -22,6 +22,14 @@ ssh_cmd() {
     ssh "$ROUTER" "$1" 2>/dev/null
 }
 
+# Every drift goes through here so --check can exit non-zero when anything
+# needs fixing. A dry run that always exits 0 is not an instrument.
+FIXES=0
+fix() {
+    echo "  FIX $*"
+    FIXES=$((FIXES + 1))
+}
+
 # --- UCI desired state ---
 # format: package.key=value
 # DNS handled separately in apply_dns_settings() because the schema changed
@@ -30,11 +38,16 @@ UCI_SETTINGS="
 repeater.@main[0].auto=2
 repeater.@main[0].disabled=0
 mtkhnat.global.enable=0
-dhcp.@dnsmasq[0].cachesize=1000
 kmwan.modem_1_1_2.disabled=1
 kmwan.modem_1_1_2_6.disabled=1
 kmwan.global.sensitivity=10000
+firewall.@defaults[0].tcp_ecn=2
 "
+# firewall note:
+#   fw3 writes /proc/sys/net/ipv4/tcp_ecn from this option (default 0) on every
+#   firewall reload -- boot and each ifup -- after /etc/sysctl.d has run, so the
+#   tcp_ecn line in the sysctl file alone never held (found 2026-09-10).
+#   2 = ECN when the peer asks for it; pairs with CAKE.
 # repeater note:
 #   disabled=0 -- the web UI repeater off-toggle sets disabled=1, which stops
 #   the gl-repeater daemon entirely: no scanning, no ubus repeater API, and
@@ -80,10 +93,18 @@ echo ""
 echo "=== Firmware Version ==="
 GLVERSION=$(ssh_cmd "cat /etc/glversion 2>/dev/null" | tr -d '\r\n') || true
 case "$GLVERSION" in
-    4.7.*|4.8.*|4.9.*) echo "  OK  glversion $GLVERSION (tested)" ;;
-    "")                echo "  WARN /etc/glversion missing; proceeding anyway" ;;
-    *)                 echo "  WARN glversion $GLVERSION not in tested set (4.7/4.8/4.9). UCI schema may have shifted; review provision output before commit." ;;
+    4.7.* | 4.8.* | 4.9.* | 4.11.*) echo "  OK  glversion $GLVERSION (tested)" ;;
+    "") echo "  WARN /etc/glversion missing; proceeding anyway" ;;
+    *) echo "  WARN glversion $GLVERSION not in tested set (4.7/4.8/4.9/4.11). UCI schema may have shifted; review provision output before commit." ;;
 esac
+# Same API the download centre uses; newest RELEASE entry comes first.
+latest_fw=$(curl -s --max-time 5 'https://firmware-api.gl-inet.com/cloud-api/model/info?model=mt3000' 2>/dev/null |
+    grep -o '"version":"[^"]*","stage":"RELEASE"' | head -1 | cut -d'"' -f4 || true)
+# Only nag when stable is actually newer (a beta ahead of stable is fine).
+if [ -n "$latest_fw" ] && [ -n "$GLVERSION" ] && [ "$latest_fw" != "$GLVERSION" ] &&
+    [ "$(printf '%s\n%s\n' "$GLVERSION" "$latest_fw" | sort -V | tail -1)" = "$latest_fw" ]; then
+    echo "  INFO stable firmware $latest_fw available (running $GLVERSION); see README-config.txt upgrade checklist"
+fi
 echo ""
 
 # --- SSH key ---
@@ -94,7 +115,7 @@ if [ -f "$PUBKEY_FILE" ]; then
     if ssh_cmd "grep -qF '$(echo "$pubkey" | awk '{print $2}')' /etc/dropbear/authorized_keys 2>/dev/null"; then
         echo "  OK  SSH key installed"
     else
-        echo "  FIX SSH key not in authorized_keys"
+        fix "SSH key not in authorized_keys"
         if ! $CHECK_ONLY; then
             echo "$pubkey" | ssh "$ROUTER" "cat >> /etc/dropbear/authorized_keys" 2>/dev/null
             echo "  Installed"
@@ -119,7 +140,7 @@ for line in $UCI_SETTINGS; do
     elif [ "$key" = "mtkhnat.global.enable" ] && ssh_cmd "test -f /etc/setup-link.last"; then
         echo "  OK  $key = $current (managed by setup-link)"
     else
-        echo "  FIX $key: $current -> $want"
+        fix "$key: $current -> $want"
         if ! $CHECK_ONLY; then
             ssh_cmd "uci set $key='$want'"
             pkg="${key%%.*}"
@@ -132,6 +153,12 @@ if ! $CHECK_ONLY && [ -n "$CHANGED_PACKAGES" ]; then
     for pkg in $CHANGED_PACKAGES; do
         ssh_cmd "uci commit $pkg"
         echo "  Committed: $pkg"
+        case "$pkg" in
+            firewall)
+                ssh_cmd "/etc/init.d/firewall reload >/dev/null 2>&1"
+                echo "  Reloaded: firewall"
+                ;;
+        esac
     done
 fi
 echo ""
@@ -143,7 +170,7 @@ echo "=== Repeater Daemon ==="
 if ssh_cmd "ubus -t 3 call repeater status >/dev/null 2>&1"; then
     echo "  OK  gl-repeater running"
 else
-    echo "  FIX gl-repeater not running"
+    fix "gl-repeater not running"
     if ! $CHECK_ONLY; then
         ssh_cmd "/etc/init.d/repeater enable; /etc/init.d/repeater start; sleep 3"
         if ssh_cmd "ubus -t 3 call repeater status >/dev/null 2>&1"; then
@@ -157,6 +184,7 @@ echo ""
 
 # --- WiFi .dat files ---
 echo "=== WiFi .dat Tuning ==="
+dat_changed=false
 for band in b0 b1; do
     dat="/etc/wireless/mediatek/mt7981.dbdc.${band}.dat"
     echo "  --- $band ---"
@@ -164,18 +192,25 @@ for band in b0 b1; do
         [ -z "$line" ] && continue
         key="${line%%=*}"
         want="${line#*=}"
-        current=$(ssh_cmd "grep ^${key}= $dat" | cut -d= -f2)
+        current=$(ssh_cmd "grep ^${key}= $dat" | cut -d= -f2 || true)
 
         if [ "$current" = "$want" ]; then
             echo "  OK  $key = $want"
         else
-            echo "  FIX $key: ${current:-UNSET} -> $want"
+            fix "$key: ${current:-UNSET} -> $want"
             if ! $CHECK_ONLY; then
                 ssh_cmd "sed -i 's/^${key}=.*/${key}=${want}/' $dat"
+                dat_changed=true
             fi
         fi
     done
 done
+# The driver reads the .dat only at (re)load; without this the edit is inert
+# until the next reboot. Drops WiFi for a few seconds.
+if $dat_changed; then
+    ssh_cmd "wifi reload" || true
+    echo "  Reloaded: wifi (brief WiFi drop)"
+fi
 echo ""
 
 # --- Sysctl config ---
@@ -194,13 +229,40 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30'
 if ssh_cmd "cat $SYSCTL_FILE 2>/dev/null" | grep -q "tcp_ecn = 2"; then
     echo "  OK  $SYSCTL_FILE exists and looks correct"
 else
-    echo "  FIX $SYSCTL_FILE needs creating/updating"
+    fix "$SYSCTL_FILE needs creating/updating"
     if ! $CHECK_ONLY; then
         echo "$SYSCTL_CONTENT" | ssh "$ROUTER" "cat > $SYSCTL_FILE" 2>/dev/null
         ssh_cmd "sysctl -p $SYSCTL_FILE" >/dev/null
         echo "  Written and applied"
     fi
 fi
+
+# The file being right is not the same as the kernel agreeing: something later
+# in boot can rewrite a key (fw3 did exactly that to tcp_ecn). Compare live.
+# setup-link retunes tcp_rmem/tcp_wmem/tcp_limit_output_bytes per link tier,
+# so only the keys it leaves alone are checked here.
+SYSCTL_LIVE="
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_ecn=2
+net.ipv4.tcp_fastopen=3
+net.netfilter.nf_conntrack_tcp_timeout_established=3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
+"
+for line in $SYSCTL_LIVE; do
+    [ -z "$line" ] && continue
+    key="${line%%=*}"
+    want="${line#*=}"
+    current=$(ssh_cmd "sysctl -n $key" | tr -d '\r' || echo "UNSET")
+    if [ "$current" = "$want" ]; then
+        echo "  OK  live $key = $want"
+    else
+        fix "live $key: ${current:-UNSET} -> $want"
+        if ! $CHECK_ONLY; then
+            ssh_cmd "sysctl -qw $key=$want"
+            echo "  Applied"
+        fi
+    fi
+done
 echo ""
 
 # --- DNS settings (encrypted DNS via NextDNS over TLS) ---
@@ -222,6 +284,23 @@ else
 fi
 echo "  Using package: $DNS_PKG"
 
+# dnsmasq cache only matters on the 4.8 stack (dnsmasq -> stubby). From 4.9 the
+# forwarder behind dnsmasq keeps its own cache and the firmware strips the
+# dnsmasq cachesize key on every boot (seen on 4.11.0), so do not fight it.
+if [ "$DNS_PKG" = "gl-dns" ]; then
+    current=$(ssh_cmd "uci -q get dhcp.@dnsmasq[0].cachesize" || echo "UNSET")
+    if [ "$current" = "1000" ]; then
+        echo "  OK  dhcp.@dnsmasq[0].cachesize = 1000"
+    else
+        fix "dhcp.@dnsmasq[0].cachesize: $current -> 1000"
+        if ! $CHECK_ONLY; then
+            ssh_cmd "uci set dhcp.@dnsmasq[0].cachesize='1000'; uci commit dhcp"
+        fi
+    fi
+else
+    echo "  SKIP dnsmasq cachesize ($DNS_PKG firmware re-applies DNS at boot and deletes it)"
+fi
+
 dns_changed=false
 for line in $DECLS; do
     key="${line%%=*}"
@@ -230,7 +309,7 @@ for line in $DECLS; do
     if [ "$current" = "$want" ]; then
         echo "  OK  $DNS_PKG.@dns[0].$key = $want"
     else
-        echo "  FIX $DNS_PKG.@dns[0].$key: $current -> $want"
+        fix "$DNS_PKG.@dns[0].$key: $current -> $want"
         if ! $CHECK_ONLY; then
             ssh_cmd "uci set $DNS_PKG.@dns[0].$key='$want'"
             dns_changed=true
@@ -242,7 +321,7 @@ nextdns_id=$(ssh_cmd "uci -q get $DNS_PKG.@dns[0].nextdns_id" || echo "")
 if [ -n "$nextdns_id" ]; then
     echo "  OK  NextDNS ID = $nextdns_id"
 else
-    echo "  FIX NextDNS ID not set"
+    fix "NextDNS ID not set"
     if ! $CHECK_ONLY; then
         read -rp "  Enter NextDNS profile ID: " nextdns_id
         if [ -z "$nextdns_id" ]; then
@@ -265,12 +344,12 @@ echo "=== setup-link Script ==="
 LOCAL_SCRIPT="$SCRIPT_DIR/setup-link"
 if [ -f "$LOCAL_SCRIPT" ]; then
     local_hash=$(md5 -r "$LOCAL_SCRIPT" | cut -d' ' -f1)
-    remote_hash=$(ssh_cmd "md5sum /usr/bin/setup-link" | cut -d' ' -f1)
+    remote_hash=$(ssh_cmd "md5sum /usr/bin/setup-link" | cut -d' ' -f1 || true)
 
     if [ "$local_hash" = "$remote_hash" ]; then
         echo "  OK  /usr/bin/setup-link is current"
     else
-        echo "  FIX setup-link differs (local: ${local_hash:0:8}, remote: ${remote_hash:0:8})"
+        fix "setup-link differs (local: ${local_hash:0:8}, remote: ${remote_hash:0:8})"
         if ! $CHECK_ONLY; then
             scp -O "$LOCAL_SCRIPT" "$ROUTER:/usr/bin/setup-link" 2>/dev/null
             ssh_cmd "chmod +x /usr/bin/setup-link"
@@ -290,19 +369,19 @@ START=99
 start() {
     /usr/bin/setup-link boot
 }'
-remote_init=$(ssh_cmd "cat $INIT_SCRIPT 2>/dev/null")
+remote_init=$(ssh_cmd "cat $INIT_SCRIPT 2>/dev/null" || true)
 if [ "$remote_init" = "$INIT_CONTENT" ]; then
     if ssh_cmd "test -L /etc/rc.d/S99setup-link"; then
         echo "  OK  Init script installed and enabled"
     else
-        echo "  FIX Init script exists but not enabled"
+        fix "Init script exists but not enabled"
         if ! $CHECK_ONLY; then
             ssh_cmd "$INIT_SCRIPT enable"
             echo "  Enabled"
         fi
     fi
 else
-    echo "  FIX Init script missing or outdated"
+    fix "Init script missing or outdated"
     if ! $CHECK_ONLY; then
         echo "$INIT_CONTENT" | ssh "$ROUTER" "cat > $INIT_SCRIPT && chmod +x $INIT_SCRIPT" 2>/dev/null
         ssh_cmd "$INIT_SCRIPT enable"
@@ -315,48 +394,160 @@ echo ""
 echo "=== README ==="
 LOCAL_README="$SCRIPT_DIR/README-config.txt"
 if [ -f "$LOCAL_README" ]; then
-    if $CHECK_ONLY; then
-        echo "  OK  $LOCAL_README exists (will sync on apply)"
+    local_hash=$(md5 -r "$LOCAL_README" | cut -d' ' -f1)
+    remote_hash=$(ssh_cmd "md5sum /root/README-config.txt" | cut -d' ' -f1 || true)
+    if [ "$local_hash" = "$remote_hash" ]; then
+        echo "  OK  /root/README-config.txt is current"
     else
-        scp -O "$LOCAL_README" "$ROUTER:/root/README-config.txt" 2>/dev/null
-        echo "  OK  Synced /root/README-config.txt"
+        fix "README-config.txt differs (local: ${local_hash:0:8}, remote: ${remote_hash:0:8})"
+        if ! $CHECK_ONLY; then
+            scp -O "$LOCAL_README" "$ROUTER:/root/README-config.txt" 2>/dev/null
+            echo "  Synced /root/README-config.txt"
+        fi
     fi
 else
     echo "  SKIP $LOCAL_README not found locally"
 fi
 echo ""
 
+# --- Router extras ---
+# Things setup-link needs that are not in the GL image and vanish on a flash:
+# the Ookla CLI (copied by hand, no package) and luci-base, whose tzdata.lua
+# gives 'setup-link timezone' its IANA -> POSIX map. sqm-scripts and
+# kmod-sched-cake are user-installed on 4.8.x but ship in the image from 4.9.0.
+echo "=== Router Extras ==="
+if ssh_cmd "test -x /usr/bin/gl_speedtest"; then
+    echo "  OK  gl_speedtest present (4.11+ Cloudflare test; Ookla CLI not needed)"
+elif ssh_cmd "test -x /usr/bin/speedtest"; then
+    echo "  OK  speedtest CLI present ($(ssh_cmd 'speedtest --version 2>/dev/null | head -1' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo '?'))"
+else
+    fix "no speed test binary: fetch the Ookla aarch64 musl tarball and copy speedtest to /usr/bin"
+fi
+if ssh_cmd "test -f /usr/lib/lua/luci/sys/zoneinfo/tzdata.lua"; then
+    echo "  OK  tzdata.lua present (setup-link timezone)"
+else
+    fix "tzdata.lua missing: on router run 'opkg update && opkg install luci-base'"
+fi
+if ssh_cmd "test -x /etc/init.d/sqm && test -f /usr/lib/sqm/layer_cake.qos"; then
+    echo "  OK  sqm-scripts present"
+else
+    fix "sqm-scripts missing: on router run 'opkg update && opkg install sqm-scripts kmod-sched-cake'"
+fi
+
+# opkg packages we want on the router. A flash drops them; re-provisioning
+# puts them back. Keep this list short: tcpdump and mtr are the two tools that
+# have earned their place debugging hotel links.
+OPKG_PKGS="tcpdump mtr"
+pkg_missing=""
+for pk in $OPKG_PKGS; do
+    ssh_cmd "opkg list-installed 2>/dev/null | grep -q '^$pk '" || pkg_missing="$pkg_missing $pk"
+done
+if [ -z "$pkg_missing" ]; then
+    echo "  OK  opkg packages present: $OPKG_PKGS"
+else
+    fix "opkg packages missing:$pkg_missing"
+    if ! $CHECK_ONLY; then
+        ssh_cmd "opkg update >/dev/null 2>&1; opkg install$pkg_missing >/dev/null 2>&1" && echo "  Installed:$pkg_missing" || echo "  ERROR: opkg install failed; on router run 'opkg update && opkg install$pkg_missing'" >&2
+    fi
+fi
+
+# GL's first-boot SQM script (4.9.0 rewrites, 4.11.0 deletes) acts on
+# sqm.@queue[0] without checking what it is. Keep the stock disabled eth1
+# stanza in slot 0 so setup-link's eth0 queue is never the one it touches.
+# Section name, not .interface: GL's 4.11 script recreates eth1 as a bare
+# section with no options.
+first_queue=$(ssh_cmd "uci -q show sqm.@queue[0] | head -1 | cut -d= -f1 | cut -d. -f2" | tr -d '\r' || true)
+if [ "$first_queue" = "eth1" ]; then
+    echo "  OK  sqm.@queue[0] is eth1 (eth0 shielded from GL first-boot scripts)"
+elif [ -z "$first_queue" ]; then
+    echo "  SKIP no sqm queues yet (setup-link apply creates eth0)"
+else
+    fix "sqm.@queue[0] is $first_queue, want eth1 first"
+    if ! $CHECK_ONLY; then
+        ssh_cmd "uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue; uci -q get sqm.eth1.interface >/dev/null || { uci set sqm.eth1.enabled=0; uci set sqm.eth1.interface=eth1; }; uci reorder sqm.eth1=0; uci commit sqm"
+        echo "  Reordered: sqm.eth1 -> slot 0"
+    fi
+fi
+echo ""
+
+# --- Sysupgrade keep list ---
+# sysupgrade keeps /etc/config and a fixed list; everything else on the overlay
+# is gone after a flash. /etc/sysupgrade.conf is itself on the keep list, and
+# any path in it rides along in the config backup. Verified on the 4.8.1 ->
+# 4.11.0 flash: setup-link, its boot state and the Ookla binary all vanished.
+echo "=== Sysupgrade Keep List ==="
+KEEP_PATHS="/usr/bin/setup-link /etc/init.d/setup-link /etc/rc.d/S99setup-link /etc/setup-link.last /etc/sysctl.d/99-latency-tuning.conf /usr/bin/speedtest /root/README-config.txt"
+keep_missing=""
+for kp in $KEEP_PATHS; do
+    ssh_cmd "grep -qxF '$kp' /etc/sysupgrade.conf 2>/dev/null" || keep_missing="$keep_missing $kp"
+done
+if [ -z "$keep_missing" ]; then
+    echo "  OK  /etc/sysupgrade.conf lists setup-link, its state, sysctl file, speedtest"
+else
+    fix "/etc/sysupgrade.conf missing:$keep_missing"
+    if ! $CHECK_ONLY; then
+        for kp in $keep_missing; do ssh_cmd "echo '$kp' >> /etc/sysupgrade.conf"; done
+        echo "  Added"
+    fi
+fi
+echo ""
+
 # --- Tailscale ---
+# GL's in-UI updater writes a new daemon to /usr/sbin/tailscaled and its CLI to
+# /usr/bin/tailscale, but leaves any older /usr/sbin/tailscale in place, which
+# shadows the new CLI on PATH and is the binary /usr/bin/gl_tailscale calls.
+# gl_tailscale also runs 'tailscale up --reset' on every reload, so flags passed
+# by hand (exit node, routes) never survive: set those in the web UI.
 echo "=== Tailscale ==="
-if ssh_cmd "which tailscale >/dev/null 2>&1"; then
+if ssh_cmd "which tailscaled >/dev/null 2>&1"; then
+    daemon_ver=$(ssh_cmd "tailscaled --version 2>/dev/null | head -1" | tr -d '\r' || true)
+    cli_ver=$(ssh_cmd "tailscale version 2>/dev/null | head -1" | tr -d '\r' || true)
+    if [ -n "$daemon_ver" ] && [ "$cli_ver" = "$daemon_ver" ]; then
+        echo "  OK  tailscale CLI and daemon both $daemon_ver"
+    else
+        fix "tailscale CLI ${cli_ver:-missing} != tailscaled ${daemon_ver:-unknown}"
+        if ! $CHECK_ONLY; then
+            alt_ver=$(ssh_cmd "/usr/bin/tailscale version 2>/dev/null | head -1" | tr -d '\r' || true)
+            if [ -n "$alt_ver" ] && [ "$alt_ver" = "$daemon_ver" ]; then
+                ssh_cmd "ln -sf /usr/bin/tailscale /usr/sbin/tailscale"
+                echo "  Linked /usr/sbin/tailscale -> /usr/bin/tailscale ($alt_ver)"
+            else
+                echo "  No CLI matching the daemon on the router; update Tailscale from the web UI (Applications > Tailscale)"
+            fi
+        fi
+    fi
+
+    latest_ver=$(curl -s --max-time 5 'https://pkgs.tailscale.com/stable/?mode=json' 2>/dev/null | grep -o '"Version": *"[^"]*"' | cut -d'"' -f4 || true)
+    if [ -n "$latest_ver" ] && [ -n "$daemon_ver" ] && [ "$latest_ver" != "$daemon_ver" ]; then
+        echo "  INFO tailscale $daemon_ver installed, $latest_ver is current stable (update from the web UI)"
+    fi
+
     ts_status=$(ssh_cmd "tailscale status --json 2>/dev/null" | grep -o '"BackendState": *"[^"]*"' | cut -d'"' -f4 || true)
     if [ "$ts_status" = "Running" ]; then
-        ts_ip=$(ssh_cmd "tailscale ip -4 2>/dev/null")
+        ts_ip=$(ssh_cmd "tailscale ip -4 2>/dev/null" || true)
         echo "  OK  Tailscale running ($ts_ip)"
     elif [ "$ts_status" = "NeedsLogin" ]; then
-        echo "  FIX Tailscale needs login"
-        if ! $CHECK_ONLY; then
-            echo "  Run on router: tailscale up --accept-routes --advertise-exit-node"
-            echo "  Then authenticate via the URL it prints."
-        fi
+        fix "Tailscale needs login: enable and log in from the web UI (Applications > Tailscale)"
     else
-        echo "  FIX Tailscale not running (state: ${ts_status:-unknown})"
+        fix "Tailscale not running (state: ${ts_status:-unknown})"
         if ! $CHECK_ONLY; then
             ssh_cmd "/etc/init.d/tailscale start 2>/dev/null"
-            echo "  Started. May need: tailscale up --accept-routes"
+            echo "  Started. If it stays down, enable it from the web UI (Applications > Tailscale)"
         fi
     fi
 else
     echo "  NOT INSTALLED"
-    echo "  Install via GL.iNet web UI: Applications > Tailscale"
-    echo "  Or: opkg update && opkg install tailscale"
-    echo "  Then: tailscale up --accept-routes --advertise-exit-node"
+    echo "  Install and enable via the web UI: Applications > Tailscale"
 fi
 echo ""
 
 # --- Summary ---
 if $CHECK_ONLY; then
-    echo "=== Dry run complete. Run without --check to apply. ==="
+    if [ "$FIXES" -gt 0 ]; then
+        echo "=== Dry run: $FIXES item(s) need fixing. Run without --check to apply. ==="
+        exit 1
+    fi
+    echo "=== Dry run: everything OK. ==="
 else
     echo "=== Provisioning complete ==="
     echo ""

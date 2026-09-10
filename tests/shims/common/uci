@@ -1,0 +1,18 @@
+#!/bin/sh
+# Test double for uci: key=value lines in $UCI_STORE. Enough for setup-link.
+S="${UCI_STORE:?UCI_STORE unset}"
+q=0
+[ "$1" = "-q" ] && { q=1; shift; }
+case "$1" in
+    get)
+        v=$(grep "^$2=" "$S" | tail -1 | cut -d= -f2-)
+        [ -n "$v" ] && { echo "$v"; exit 0; }
+        [ "$q" = 1 ] || echo "uci: Entry not found" >&2
+        exit 1 ;;
+    set)
+        k="${2%%=*}"; v="${2#*=}"
+        grep -v "^$k=" "$S" > "$S.tmp"; echo "$k=$v" >> "$S.tmp"; mv "$S.tmp" "$S" ;;
+    show) grep "^$2" "$S" ;;
+    commit | reorder | delete | del) exit 0 ;;
+    *) echo "uci shim: unsupported: $*" >&2; exit 2 ;;
+esac

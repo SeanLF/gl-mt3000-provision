@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$*" in
+    *countryCode*) echo "CA" ;;
+    *timezone*) echo "America/Toronto" ;;
+esac

@@ -1,0 +1,22 @@
+# Tooling for this repo. shellcheck/shfmt come from the global mise config.
+[tasks.lint]
+description = "shellcheck + shfmt on both scripts"
+run = """
+shellcheck -S warning provision.sh setup-link
+shfmt -d -i 4 -ci provision.sh setup-link
+"""
+
+[tasks.test]
+description = "bats suite: setup-link against command shims, no router needed"
+run = "bats tests/"
+
+[tasks.check]
+description = "Dry-run provisioning against the router (exit 1 if anything would change)"
+run = "./provision.sh --check"
+
+[tasks.apply]
+description = "Apply provisioning to the router"
+run = "./provision.sh"
+
+[tools]
+"aqua:bats-core/bats-core" = "latest"

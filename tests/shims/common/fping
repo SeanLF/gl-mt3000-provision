@@ -1,0 +1,5 @@
+#!/bin/sh
+# First call is the idle measurement, later calls are under load.
+C="${FPING_CALLS:?}"; n=$(cat "$C" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$C"
+if [ "$n" -eq 1 ]; then am="${FAKE_IDLE:-20.0/25.0}"; else am="${FAKE_LOADED:-21.0/26.0}"; fi
+echo "1.1.1.1 : xmt/rcv/%loss = 8/8/0%, min/avg/max = 18.0/$am"

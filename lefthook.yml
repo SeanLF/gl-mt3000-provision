@@ -1,0 +1,9 @@
+# Opt in per clone (global hook requires it): git config --local hooks.lefthook true
+pre-commit:
+  commands:
+    lint:
+      glob: "{provision.sh,setup-link}"
+      run: mise run lint
+    test:
+      glob: "{setup-link,tests/**}"
+      run: mise run test
