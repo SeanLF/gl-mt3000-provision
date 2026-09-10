@@ -61,7 +61,7 @@ setup-link timezone [zone]         Set/detect timezone (IANA name, real DST rule
 setup-link status                  Show current config
 ```
 
-Shaping decision: under 50 Mbps gets CAKE at 85% with tight TCP buffers, 50-100 Mbps gets 92%. Above 100 Mbps the speed test's ping-under-load decides: if the link adds more than 10 ms when saturated it gets CAKE at 92%, otherwise hardware offload and no SQM. Above 300 Mbps the CPU is the limit and it always runs unshaped. The `dsl` link type adds ATM framing overhead and MTU 1450 for clean cell alignment; `docsis` uses the 18-byte cable-modem overhead.
+Shaping decision: under 50 Mbps gets CAKE at 85% with tight TCP buffers, 50-100 Mbps gets 92%. Above 100 Mbps ping-under-load decides: if the link adds more than 10 ms when saturated, or the latency could not be measured, it gets CAKE at 92%; only a link measured clean runs with hardware offload and no SQM. Above 300 Mbps (an estimate of the CPU's CAKE ceiling) it always runs unshaped. The `dsl` link type adds ATM framing overhead and MTU 1450 for clean cell alignment; `docsis` uses the 18-byte cable-modem overhead.
 
 WiFi join goes through the same ubus API as the web UI: encryption auto-detected, only SSID and key needed. If the repeater was disabled from the web UI (which silently kills the join API), `setup-link wifi` re-enables it.
 

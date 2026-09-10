@@ -11,6 +11,10 @@ case "$1" in
         exit 1 ;;
     set)
         k="${2%%=*}"; v="${2#*=}"
+        # pkg.section.option needs the section to exist, like real uci.
+        case "$k" in
+            *.*.*) sect="${k%.*}"; grep -q "^$sect=" "$S" || { echo "uci: Invalid argument" >&2; exit 1; } ;;
+        esac
         grep -v "^$k=" "$S" > "$S.tmp"; echo "$k=$v" >> "$S.tmp"; mv "$S.tmp" "$S" ;;
     show) grep "^$2" "$S" ;;
     commit | reorder | delete | del) exit 0 ;;

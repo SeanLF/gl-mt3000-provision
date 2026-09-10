@@ -21,8 +21,13 @@ SQM_INIT="${SETUP_LINK_SQM_INIT:-/etc/init.d/sqm}"
 # question is whether the link bloats: measure ping under load and shape only if
 # it does. Above CAKE_MAX_KBPS the MT3000 CPU is the bottleneck, so run unshaped.
 BLOAT_OK_MS=10       # loaded-minus-idle avg ping at or below this = clean unshaped
-CAKE_MAX_KBPS=300000 # rough CAKE ceiling on the mt7981 without hardware offload
+CAKE_MAX_KBPS=300000 # CAKE ceiling on the mt7981 without hardware offload: an ESTIMATE, not measured
+MIN_MBPS=1           # a measured rate below this is a stalled transfer, not a link
 LATENCY_TARGET="${SETUP_LINK_LATENCY_TARGET:-1.1.1.1}"
+# Transfer caps per phase; max_time 10 s bounds slow links, these bound fast ones
+# (tethered phones pay per byte): at most ~150 MB per arrive.
+CF_DL_BYTES=104857600
+CF_UL_BYTES=52428800
 
 # --- helpers ---
 
@@ -203,34 +208,36 @@ save_state() {
 }
 
 # --- latency under load ---
+# One instrument for idle and loaded: fping (4.11+) or busybox ping to
+# LATENCY_TARGET. gl_speedtest's own ping lines go to a different target
+# (Cloudflare's edge), so mixing the two would fake the threshold.
 
-# "avg max" ping in ms over $1 samples $2 ms apart to LATENCY_TARGET; empty on
-# failure. fping ships from firmware 4.11; busybox ping is the fallback.
+# "avg max" ping in ms over $1 samples $2 ms apart; empty on failure. -t 2000
+# so the slow, bloated replies count instead of being dropped as lost.
 ping_stats() {
     if command -v fping >/dev/null 2>&1; then
-        fping -c "$1" -p "$2" -q "$LATENCY_TARGET" 2>&1
+        fping -c "$1" -p "$2" -t 2000 -q "$LATENCY_TARGET" 2>&1
     else
         ping -c "$1" -W 2 "$LATENCY_TARGET" 2>/dev/null | tail -1
     fi | sed -n 's#.*min/avg/max = [0-9.]*/\([0-9.]*\)/\([0-9.]*\).*#\1 \2#p'
 }
 
-# Run "$@" (stdout to file $1) while sampling ping; sets LOADED_MS/LOADED_MAX_MS.
-# Sampling starts a second in so the transfer is already saturating.
+# Run "$@" (stdout to file $1) while sampling ping in 2 s windows for its whole
+# life; LOADED_MS = the worst window's average. Sampling starts a second in so
+# the transfer is already saturating.
 under_load() {
     out="$1"
     shift
     stats=$(mktemp)
-    (
-        sleep 1
-        ping_stats 8 1000 >"$stats"
-    ) &
-    pinger=$!
-    "$@" >"$out" 2>/dev/null
+    "$@" >"$out" 2>/dev/null &
+    child=$!
+    sleep "${SETUP_LINK_LOAD_DELAY:-1}"
+    while kill -0 "$child" 2>/dev/null; do
+        ping_stats 4 500 >>"$stats"
+    done
+    wait "$child"
     rc=$?
-    wait "$pinger"
-    # shellcheck disable=SC2046
-    set -- $(cat "$stats")
-    LOADED_MS="${1:-}"
+    LOADED_MS=$(awk '{ if ($1 + 0 > m) m = $1 + 0 } END { if (m > 0) print m }' "$stats")
     rm -f "$stats"
     return $rc
 }
@@ -249,38 +256,42 @@ compute_bloat() {
     BLOAT_MS=$(echo "$worst $IDLE_MS" | awk '{ d = $1 - $2; if (d < 0) d = 0; printf "%d", d + 0.5 }')
 }
 
-# Prints "off" or "apply" for a measured link; see the constants at the top.
-decide_mode() {
+# Single source for the verdict and its reason: "off|why" or "apply|why".
+# Unmeasured latency on a fast link shapes rather than gambles: the tax is
+# ~8% throughput, the alternative is a bloated link persisted at every boot.
+decision_reason() {
     dl="$1"
     if [ "$dl" -gt "$CAKE_MAX_KBPS" ]; then
-        echo off
-    elif [ "$dl" -gt 100000 ] && [ -n "${BLOAT_MS:-}" ] && [ "$BLOAT_MS" -le "$BLOAT_OK_MS" ]; then
-        echo off
+        echo "off|Link > $((CAKE_MAX_KBPS / 1000)) Mbps: beyond CAKE on this CPU (estimate), run unshaped"
     elif [ "$dl" -gt 100000 ] && [ -z "${BLOAT_MS:-}" ]; then
-        echo off
+        echo "apply|Link > 100 Mbps, latency under load unmeasured: SQM at 92% to be safe"
+    elif [ "$dl" -gt 100000 ] && [ "$BLOAT_MS" -le "$BLOAT_OK_MS" ]; then
+        echo "off|Link > 100 Mbps and clean under load (+${BLOAT_MS} ms <= ${BLOAT_OK_MS}): no SQM needed"
+    elif [ "$dl" -gt 100000 ]; then
+        echo "apply|Link > 100 Mbps but bloats under load (+${BLOAT_MS} ms > ${BLOAT_OK_MS}): SQM at 92%"
+    elif [ "$dl" -gt 50000 ]; then
+        echo "apply|Link 50-100 Mbps: SQM at 92%"
     else
-        echo apply
+        echo "apply|Link < 50 Mbps: SQM at 85%"
     fi
 }
 
+decide_mode() {
+    decision_reason "$1" | cut -d'|' -f1
+}
+
 explain_decision() {
-    dl="$1"
     if [ -n "${BLOAT_MS:-}" ]; then
         echo "  Bufferbloat: idle ${IDLE_MS} ms, loaded ${LOADED_DL_MS:-?} down / ${LOADED_UL_MS:-?} up (+${BLOAT_MS} ms)"
     fi
-    if [ "$dl" -gt "$CAKE_MAX_KBPS" ]; then
-        echo "  Link > $((CAKE_MAX_KBPS / 1000)) Mbps: beyond CAKE on this CPU, run unshaped"
-    elif [ "$dl" -gt 100000 ] && [ -z "${BLOAT_MS:-}" ]; then
-        echo "  Link > 100 Mbps and latency under load unmeasured: run unshaped"
-    elif [ "$dl" -gt 100000 ] && [ "$BLOAT_MS" -le "$BLOAT_OK_MS" ]; then
-        echo "  Link > 100 Mbps and clean under load (+${BLOAT_MS} ms <= ${BLOAT_OK_MS}): no SQM needed"
-    elif [ "$dl" -gt 100000 ]; then
-        echo "  Link > 100 Mbps but bloats under load (+${BLOAT_MS} ms > ${BLOAT_OK_MS}): SQM at 92%"
-    elif [ "$dl" -gt 50000 ]; then
-        echo "  Link 50-100 Mbps: SQM at 92%"
-    else
-        echo "  Link < 50 Mbps: SQM at 85%"
-    fi
+    echo "  $(decision_reason "$1" | cut -d'|' -f2-)"
+}
+
+# A parsed rate below MIN_MBPS is a stalled transfer (captive portal, dying
+# LTE): fail loudly rather than persist it as the shaper rate at every boot.
+rates_plausible() {
+    [ -n "$1" ] && [ -n "$2" ] || return 1
+    [ "$(echo "$1 $2 $MIN_MBPS" | awk '{ print ($1 >= $3 && $2 >= $3 / 10) ? 1 : 0 }')" = 1 ]
 }
 
 # --- speed test core (returns DL_MBPS, UL_MBPS, IDLE_MS, LOADED_*_MS via globals) ---
@@ -294,115 +305,108 @@ run_speedtest() {
         "$SQM_INIT" stop 2>/dev/null
     fi
 
-    # 4.11+ ships gl_speedtest (Cloudflare, nearest PoP, no server roulette).
-    # Prefer it; fall back to the hand-copied Ookla CLI on older firmware.
-    if command -v gl_speedtest >/dev/null 2>&1; then
-        run_speedtest_cloudflare
-        return $?
-    fi
-
-    echo "  Running Ookla speedtest..."
+    DL_MBPS=""
+    UL_MBPS=""
     # shellcheck disable=SC2046
     set -- $(ping_stats 10 200)
     IDLE_MS="${1:-}"
-    raw=$(mktemp)
-    under_load "$raw" speedtest --accept-license --accept-gdpr -f json || true
-    RAW=$(cat "$raw")
-    rm -f "$raw"
-    # Ookla runs both directions inside one process, so one loaded figure
-    # covers both.
-    LOADED_DL_MS="$LOADED_MS"
-    LOADED_UL_MS="$LOADED_MS"
+
+    # 4.11+ ships gl_speedtest (Cloudflare, nearest PoP, no server roulette).
+    # Prefer it; fall back to the hand-copied Ookla CLI when it is absent or
+    # gives nothing usable.
+    ok=1
+    if command -v gl_speedtest >/dev/null 2>&1; then
+        speedtest_cloudflare && ok=0
+        [ "$ok" = 0 ] || ! command -v speedtest >/dev/null 2>&1 || echo "  Falling back to the Ookla CLI..."
+    fi
+    if [ "$ok" != 0 ] && command -v speedtest >/dev/null 2>&1; then
+        speedtest_ookla && ok=0
+    fi
+    restore_sqm
+    if [ "$ok" != 0 ]; then
+        echo "  Speed test failed."
+        DL_MBPS=""
+        return 1
+    fi
     compute_bloat
-
-    if [ -z "$RAW" ]; then
-        echo "  Speedtest failed."
-        restore_sqm
-        return 1
-    fi
-
-    DL_BPS=$(echo "$RAW" | grep -o '"download":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
-    UL_BPS=$(echo "$RAW" | grep -o '"upload":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
-
-    # An unparseable result must fail loudly: 0.0 Mbps would otherwise be
-    # applied as an SQM rate and persisted for replay at every boot.
-    if [ -z "$DL_BPS" ] || [ -z "$UL_BPS" ]; then
-        echo "  Could not parse speedtest output."
-        restore_sqm
-        return 1
-    fi
-    PING=$(echo "$RAW" | grep -o '"ping":{[^}]*}' | grep -o '"latency":[0-9.]*' | cut -d: -f2)
-    SERVER=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
-    LOCATION=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"location":"[^"]*"' | cut -d'"' -f4)
-    ISP=$(echo "$RAW" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
-    URL=$(echo "$RAW" | grep -o '"url":"[^"]*"' | tail -1 | cut -d'"' -f4)
-
-    DL_MBPS=$(echo "$DL_BPS" | awk '{printf "%.1f", ($1 * 8) / 1000000}')
-    UL_MBPS=$(echo "$UL_BPS" | awk '{printf "%.2f", ($1 * 8) / 1000000}')
-
-    echo "  Server:   $SERVER ($LOCATION)"
-    echo "  ISP:      $ISP"
-    echo "  Ping:     ${PING}ms (idle ${IDLE_MS:-?} ms, loaded ${LOADED_MS:-?} ms)"
+    echo "  Ping:     idle ${IDLE_MS:-?} ms, loaded ${LOADED_DL_MS:-?} ms down / ${LOADED_UL_MS:-?} ms up"
     echo "  Download: ${DL_MBPS} Mbps"
     echo "  Upload:   ${UL_MBPS} Mbps"
-    [ -n "$URL" ] && echo "  Result:   $URL"
-
-    restore_sqm
 }
 
 # gl_speedtest args: bytes interval max_time connect_timeout concurrency.
-# max_time bounds the run, so a slow hotel link finishes in the same ~10 s as a
-# fast one. Output per phase: "idle ping avg N ms", samples, "loaded ping avg N
-# ms", "download average N Mbps", then the peak as "download N Mbps".
+# Output per phase (captured from 4.11.0 beta1, 2026-09-10):
+#   [13:40:06.350] download average 100.51 Mbps
+#   [13:40:06.350] download 105.16 Mbps            <- peak; the average is shaped
+# One phase to stdout, retried once: a dropped connection to the edge
+# otherwise costs the whole arrive.
+cf_phase() {
+    tmp=$(mktemp)
+    gl_speedtest "$1" "$2" 1.0 10 5 4 >"$tmp" 2>/dev/null || true
+    if ! grep -q "$1 average" "$tmp"; then
+        sleep 2
+        gl_speedtest "$1" "$2" 1.0 10 5 4 >"$tmp" 2>/dev/null || true
+    fi
+    cat "$tmp"
+    rm -f "$tmp"
+}
+
 # Last numeric value before "Mbps"/"ms" on the last line matching $1 in file $2.
 cf_value() {
     awk -v k="$1" 'index($0, k) { v = $(NF - 1) } END { if (v ~ /^[0-9]+(\.[0-9]+)?$/) print v }' "$2"
 }
 
-# One gl_speedtest phase into file $3, retried once: a dropped connection to
-# the edge otherwise aborts the whole arrive.
-cf_phase() {
-    gl_speedtest "$1" "$2" 1.0 10 5 4 >"$3" 2>/dev/null || true
-    grep -q "$1 average" "$3" && return 0
-    echo "  $1 phase gave no result, retrying once..."
-    sleep 2
-    gl_speedtest "$1" "$2" 1.0 10 5 4 >"$3" 2>/dev/null || true
-}
-
-run_speedtest_cloudflare() {
+speedtest_cloudflare() {
     echo "  Running Cloudflare speed test (gl_speedtest)..."
     out=$(mktemp)
-    # Each phase prints its own idle/loaded ping and a run average; the final
-    # "download N" line is the peak, so the average is what gets shaped.
-    cf_phase download 268435456 "$out"
-    IDLE_MS=$(cf_value "idle ping avg" "$out")
-    LOADED_DL_MS=$(cf_value "loaded ping avg" "$out")
+    under_load "$out" cf_phase download "$CF_DL_BYTES" || true
     dl=$(cf_value "download average" "$out")
-    cf_phase upload 134217728 "$out"
-    # Each phase measures idle itself; a phase can print the line without a
-    # number when its probe fails, so take whichever phase has one.
-    [ -n "$IDLE_MS" ] || IDLE_MS=$(cf_value "idle ping avg" "$out")
-    LOADED_UL_MS=$(cf_value "loaded ping avg" "$out")
+    LOADED_DL_MS="$LOADED_MS"
+    under_load "$out" cf_phase upload "$CF_UL_BYTES" || true
     ul=$(cf_value "upload average" "$out")
+    LOADED_UL_MS="$LOADED_MS"
     rm -f "$out"
-    if [ -z "$IDLE_MS" ]; then
-        # shellcheck disable=SC2046
-        set -- $(ping_stats 10 200)
-        IDLE_MS="${1:-}"
-    fi
-    compute_bloat
-    if [ -z "$dl" ] || [ -z "$ul" ]; then
-        echo "  Speed test failed (gl_speedtest gave no result)."
-        restore_sqm
+    if ! rates_plausible "$dl" "$ul"; then
+        echo "  gl_speedtest gave no usable result (down '${dl:-none}', up '${ul:-none}' Mbps)."
         return 1
     fi
     DL_MBPS=$(echo "$dl" | awk '{ printf "%.1f", $1 }')
     UL_MBPS=$(echo "$ul" | awk '{ printf "%.2f", $1 }')
-    echo "  Server:   speed.cloudflare.com (nearest PoP)"
-    echo "  Ping:     idle ${IDLE_MS:-?} ms, loaded ${LOADED_DL_MS:-?} ms down / ${LOADED_UL_MS:-?} ms up"
-    echo "  Download: ${DL_MBPS} Mbps (10 s average)"
-    echo "  Upload:   ${UL_MBPS} Mbps (10 s average)"
-    restore_sqm
+    echo "  Server:   speed.cloudflare.com (nearest PoP), 10 s averages"
+}
+
+speedtest_ookla() {
+    echo "  Running Ookla speedtest..."
+    raw=$(mktemp)
+    under_load "$raw" speedtest --accept-license --accept-gdpr -f json || true
+    RAW=$(cat "$raw")
+    rm -f "$raw"
+    # Ookla runs both directions inside one process; the worst 2 s window over
+    # the whole run stands for both.
+    LOADED_DL_MS="$LOADED_MS"
+    LOADED_UL_MS="$LOADED_MS"
+    [ -n "$RAW" ] || return 1
+
+    DL_BPS=$(echo "$RAW" | grep -o '"download":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
+    UL_BPS=$(echo "$RAW" | grep -o '"upload":{[^}]*}' | grep -o '"bandwidth":[0-9]*' | cut -d: -f2) || true
+    dl=$(echo "${DL_BPS:-0}" | awk '{ printf "%.2f", ($1 * 8) / 1000000 }')
+    ul=$(echo "${UL_BPS:-0}" | awk '{ printf "%.2f", ($1 * 8) / 1000000 }')
+    # An unparseable or stalled result must fail loudly: it would otherwise be
+    # applied as an SQM rate and persisted for replay at every boot.
+    if [ -z "$DL_BPS" ] || [ -z "$UL_BPS" ] || ! rates_plausible "$dl" "$ul"; then
+        echo "  Could not parse a usable speedtest result."
+        return 1
+    fi
+    SERVER=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+    LOCATION=$(echo "$RAW" | grep -o '"server":{[^}]*}' | grep -o '"location":"[^"]*"' | cut -d'"' -f4)
+    ISP=$(echo "$RAW" | grep -o '"isp":"[^"]*"' | cut -d'"' -f4)
+    URL=$(echo "$RAW" | grep -o '"url":"[^"]*"' | tail -1 | cut -d'"' -f4)
+    DL_MBPS=$(echo "$dl" | awk '{ printf "%.1f", $1 }')
+    UL_MBPS="$ul"
+    echo "  Server:   $SERVER ($LOCATION)"
+    echo "  ISP:      $ISP"
+    [ -n "$URL" ] && echo "  Result:   $URL"
+    return 0
 }
 
 restore_sqm() {
@@ -461,13 +465,13 @@ do_test() {
         echo "  Run: setup-link off"
     else
         echo "  Run: setup-link apply $DL_MBPS $UL_MBPS $(last_linktype)"
-        echo "  (link type: 'ethernet' default, 'dsl' on ADSL, 'docsis' behind a cable modem)"
+        echo "  (link type from the last apply here; 'ethernet' default, 'dsl' on ADSL, 'docsis' behind a cable modem)"
     fi
 }
 
 # Link type from the last apply, so re-runs at the same place keep it.
 last_linktype() {
-    lt=$(awk '$1 == "apply" { print $4 }' "$STATE_FILE" 2>/dev/null || true)
+    lt=$(awk '$1 == "apply" { print $4 } $1 == "off" { print $2 }' "$STATE_FILE" 2>/dev/null || true)
     echo "${lt:-ethernet}"
 }
 
@@ -534,6 +538,9 @@ do_apply() {
 
     echo "  SQM: ${sqm_dl}/${sqm_ul} kbps, ${linklayer}, overhead ${overhead}"
 
+    # GL's first-boot scripts can delete the section; setting options on a
+    # missing section is an error and would abort the boot replay.
+    uci -q get sqm.eth0 >/dev/null || uci set sqm.eth0=queue
     uci set sqm.eth0.enabled='1'
     uci set sqm.eth0.interface='eth0'
     uci set sqm.eth0.qdisc='cake'
@@ -553,7 +560,9 @@ do_apply() {
 
 do_off() {
     echo "Disabling SQM..."
-    uci set sqm.eth0.enabled='0'
+    # The section may not exist yet (fresh router, or deleted by a GL
+    # first-boot script); there is nothing to disable then.
+    uci -q get sqm.eth0 >/dev/null && uci set sqm.eth0.enabled='0'
     uci commit sqm
     "$SQM_INIT" stop 2>/dev/null
 
@@ -561,7 +570,8 @@ do_off() {
     set_mtu 1500
     tune_tcp fast
 
-    save_state off
+    # Keep the link type so a later apply at the same place can offer it.
+    save_state off "$(last_linktype)"
     echo "Done."
 }
 
@@ -782,18 +792,19 @@ do_arrive() {
     if [ "$(decide_mode "$dl_kbps")" = "off" ]; then
         do_off
     else
-        linktype=$(last_linktype)
-        # Only ask for wired connections -- a repeater uplink is never DSL or cable
+        # A link type belongs to a place. Interactively, offer the last one as
+        # the default; without a tty assume ethernet rather than carry an ADSL
+        # profile to a hotel.
+        linktype="ethernet"
         if [ "$uplink" = "ethernet" ] && [ -t 0 ]; then
+            linktype=$(last_linktype)
             printf "  Link type? [e]thernet / [d]sl / [c]able-docsis [%s]: " "$linktype"
             read -r answer
             case "$answer" in
                 e | E) linktype="ethernet" ;;
-                d | D) linktype="dsl" ;;
+                d | D | y | Y) linktype="dsl" ;;
                 c | C) linktype="docsis" ;;
             esac
-        elif [ "$uplink" = "repeater" ]; then
-            linktype="ethernet"
         fi
         do_apply "$DL_MBPS" "$UL_MBPS" "$linktype"
     fi

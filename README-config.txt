@@ -11,10 +11,19 @@ Upstream: FTTH ~330/430 Mbps via ISP all-in-one router.
 
 SQM/CAKE (managed by setup-link script):
   Decision rule (2026-09-10): <50 Mbps CAKE 85%; 50-100 CAKE 92%; >100 shape
-  at 92% only if ping under load rises >10 ms over idle (BLOAT_OK_MS), else
-  unshaped; >300 (CAKE_MAX_KBPS) always unshaped. On 4.11 gl_speedtest measures
-  idle/loaded ping itself and setup-link shapes on its 10 s average, not the
-  peak. On older firmware fping/ping samples during the Ookla run.
+  at 92% if ping under load rises >10 ms over idle (BLOAT_OK_MS) OR the
+  latency could not be measured (shape rather than gamble), unshaped only when
+  measured clean; >300 (CAKE_MAX_KBPS, an unmeasured estimate of the mt7981
+  CAKE ceiling) always unshaped. Latency is one instrument for idle and load:
+  fping (busybox ping before 4.11) to 1.1.1.1, sampled in 2 s windows for the
+  whole transfer, worst window wins; gl_speedtest's own ping lines target
+  Cloudflare's edge and are not mixed in. Rates are the 10 s averages, not the
+  peak, capped at 100 MB down / 50 MB up per phase for tethered phones. A
+  parsed rate under 1 Mbps is a stalled transfer and is rejected. gl_speedtest
+  failing falls back to the Ookla CLI when present. Link type is remembered
+  from the last apply/off at this place and offered as the interactive
+  default; without a tty arrive assumes ethernet (an ADSL profile must not
+  follow you to a hotel).
   Why: this DOCSIS 3.1 line (Technicolor CGA4236, PIE AQM on the modem's
   upstream) bloats a moderate +25-47 ms unshaped and delivers ~100-105 Mbps,
   so the old ">100 = unshaped" rule chose wrong here; a clean fibre line

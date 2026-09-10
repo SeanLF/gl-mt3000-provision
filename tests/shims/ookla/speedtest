@@ -1,6 +1,6 @@
 #!/bin/sh
 # Ookla CLI JSON, bandwidth in bytes/s.
 [ -n "${FAKE_DL:-}" ] || exit 1
-sleep 1.2
+sleep 0.4
 dl=$(echo "$FAKE_DL" | awk '{ printf "%d", $1 * 125000 }'); ul=$(echo "$FAKE_UL" | awk '{ printf "%d", $1 * 125000 }')
 printf '{"type":"result","ping":{"jitter":1.2,"latency":21.3},"download":{"bandwidth":%s,"bytes":1},"upload":{"bandwidth":%s,"bytes":1},"isp":"Fake ISP","server":{"name":"Fake","location":"Nowhere"},"result":{"url":"https://example/r"}}\n' "$dl" "$ul"

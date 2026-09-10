@@ -25,9 +25,19 @@ ssh_cmd() {
 # Every drift goes through here so --check can exit non-zero when anything
 # needs fixing. A dry run that always exits 0 is not an instrument.
 FIXES=0
+UNRESOLVED=0
 fix() {
     echo "  FIX $*"
     FIXES=$((FIXES + 1))
+}
+# A FIX this script cannot or did not repair; apply mode exits 1 if any remain.
+unresolved() {
+    echo "  $*" >&2
+    UNRESOLVED=$((UNRESOLVED + 1))
+}
+# Remote mutation: a non-zero exit is reported and counted, never a silent abort.
+ssh_do() {
+    ssh_cmd "$1" || unresolved "ERROR: remote command failed: $1"
 }
 
 # --- UCI desired state ---
@@ -155,7 +165,7 @@ if ! $CHECK_ONLY && [ -n "$CHANGED_PACKAGES" ]; then
         echo "  Committed: $pkg"
         case "$pkg" in
             firewall)
-                ssh_cmd "/etc/init.d/firewall reload >/dev/null 2>&1"
+                ssh_do "/etc/init.d/firewall reload >/dev/null 2>&1"
                 echo "  Reloaded: firewall"
                 ;;
         esac
@@ -192,14 +202,19 @@ for band in b0 b1; do
         [ -z "$line" ] && continue
         key="${line%%=*}"
         want="${line#*=}"
-        current=$(ssh_cmd "grep ^${key}= $dat" | cut -d= -f2 || true)
+        current=$(ssh_cmd "grep ^${key}= $dat" | head -1 | cut -d= -f2 || true)
 
         if [ "$current" = "$want" ]; then
             echo "  OK  $key = $want"
         else
             fix "$key: ${current:-UNSET} -> $want"
             if ! $CHECK_ONLY; then
-                ssh_cmd "sed -i 's/^${key}=.*/${key}=${want}/' $dat"
+                # sed on an absent key is a silent no-op; append instead.
+                if [ -n "$current" ]; then
+                    ssh_do "sed -i 's/^${key}=.*/${key}=${want}/' $dat"
+                else
+                    ssh_do "echo '${key}=${want}' >> $dat"
+                fi
                 dat_changed=true
             fi
         fi
@@ -258,7 +273,7 @@ for line in $SYSCTL_LIVE; do
     else
         fix "live $key: ${current:-UNSET} -> $want"
         if ! $CHECK_ONLY; then
-            ssh_cmd "sysctl -qw $key=$want"
+            ssh_do "sysctl -qw $key=$want"
             echo "  Applied"
         fi
     fi
@@ -417,21 +432,28 @@ echo ""
 # kmod-sched-cake are user-installed on 4.8.x but ship in the image from 4.9.0.
 echo "=== Router Extras ==="
 if ssh_cmd "test -x /usr/bin/gl_speedtest"; then
-    echo "  OK  gl_speedtest present (4.11+ Cloudflare test; Ookla CLI not needed)"
+    echo "  OK  gl_speedtest present (4.11+ Cloudflare test; Ookla CLI is the optional fallback)"
 elif ssh_cmd "test -x /usr/bin/speedtest"; then
     echo "  OK  speedtest CLI present ($(ssh_cmd 'speedtest --version 2>/dev/null | head -1' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' || echo '?'))"
 else
     fix "no speed test binary: fetch the Ookla aarch64 musl tarball and copy speedtest to /usr/bin"
+    $CHECK_ONLY || unresolved "no remedy here for the speed test binary"
 fi
 if ssh_cmd "test -f /usr/lib/lua/luci/sys/zoneinfo/tzdata.lua"; then
     echo "  OK  tzdata.lua present (setup-link timezone)"
 else
-    fix "tzdata.lua missing: on router run 'opkg update && opkg install luci-base'"
+    fix "tzdata.lua missing"
+    if ! $CHECK_ONLY; then
+        ssh_cmd "opkg update >/dev/null 2>&1; opkg install luci-base >/dev/null 2>&1" && echo "  Installed: luci-base" || unresolved "ERROR: opkg install luci-base failed"
+    fi
 fi
 if ssh_cmd "test -x /etc/init.d/sqm && test -f /usr/lib/sqm/layer_cake.qos"; then
     echo "  OK  sqm-scripts present"
 else
-    fix "sqm-scripts missing: on router run 'opkg update && opkg install sqm-scripts kmod-sched-cake'"
+    fix "sqm-scripts missing"
+    if ! $CHECK_ONLY; then
+        ssh_cmd "opkg update >/dev/null 2>&1; opkg install sqm-scripts kmod-sched-cake >/dev/null 2>&1" && echo "  Installed: sqm-scripts kmod-sched-cake" || unresolved "ERROR: opkg install sqm-scripts failed"
+    fi
 fi
 
 # opkg packages we want on the router. A flash drops them; re-provisioning
@@ -447,26 +469,27 @@ if [ -z "$pkg_missing" ]; then
 else
     fix "opkg packages missing:$pkg_missing"
     if ! $CHECK_ONLY; then
-        ssh_cmd "opkg update >/dev/null 2>&1; opkg install$pkg_missing >/dev/null 2>&1" && echo "  Installed:$pkg_missing" || echo "  ERROR: opkg install failed; on router run 'opkg update && opkg install$pkg_missing'" >&2
+        ssh_cmd "opkg update >/dev/null 2>&1; opkg install$pkg_missing >/dev/null 2>&1" && echo "  Installed:$pkg_missing" || unresolved "ERROR: opkg install failed; on router run 'opkg update && opkg install$pkg_missing'"
     fi
 fi
 
 # GL's first-boot SQM script (4.9.0 rewrites, 4.11.0 deletes) acts on
 # sqm.@queue[0] without checking what it is. Keep the stock disabled eth1
 # stanza in slot 0 so setup-link's eth0 queue is never the one it touches.
-# Section name, not .interface: GL's 4.11 script recreates eth1 as a bare
-# section with no options.
-first_queue=$(ssh_cmd "uci -q show sqm.@queue[0] | head -1 | cut -d= -f1 | cut -d. -f2" | tr -d '\r' || true)
-if [ "$first_queue" = "eth1" ]; then
-    echo "  OK  sqm.@queue[0] is eth1 (eth0 shielded from GL first-boot scripts)"
-elif [ -z "$first_queue" ]; then
+# The hazard is setup-link's own queue sitting in slot 0; anything else there
+# (the named eth1 stanza, or the anonymous one 4.11 recreates) is fine.
+first_name=$(ssh_cmd "uci -q show sqm.@queue[0] | head -1 | cut -d= -f1 | cut -d. -f2" | tr -d '\r' || true)
+first_if=$(ssh_cmd "uci -q get sqm.@queue[0].interface" | tr -d '\r' || true)
+if [ -z "$first_name" ]; then
     echo "  SKIP no sqm queues yet (setup-link apply creates eth0)"
-else
-    fix "sqm.@queue[0] is $first_queue, want eth1 first"
+elif [ "$first_name" = "eth0" ] || [ "$first_if" = "eth0" ]; then
+    fix "sqm.@queue[0] is setup-link's eth0 queue; a GL first-boot script would delete it"
     if ! $CHECK_ONLY; then
-        ssh_cmd "uci -q get sqm.eth1 >/dev/null || uci set sqm.eth1=queue; uci -q get sqm.eth1.interface >/dev/null || { uci set sqm.eth1.enabled=0; uci set sqm.eth1.interface=eth1; }; uci reorder sqm.eth1=0; uci commit sqm"
+        ssh_do "uci -q get sqm.eth1 >/dev/null || { uci set sqm.eth1=queue; uci set sqm.eth1.enabled=0; uci set sqm.eth1.interface=eth1; }; uci reorder sqm.eth1=0; uci commit sqm"
         echo "  Reordered: sqm.eth1 -> slot 0"
     fi
+else
+    echo "  OK  sqm.@queue[0] is $first_name (eth0 shielded from GL first-boot scripts)"
 fi
 echo ""
 
@@ -486,7 +509,9 @@ if [ -z "$keep_missing" ]; then
 else
     fix "/etc/sysupgrade.conf missing:$keep_missing"
     if ! $CHECK_ONLY; then
-        for kp in $keep_missing; do ssh_cmd "echo '$kp' >> /etc/sysupgrade.conf"; done
+        # Ensure the file ends in a newline first, or the first path glues onto the last line.
+        ssh_do "[ ! -s /etc/sysupgrade.conf ] || [ -z \"\$(tail -c1 /etc/sysupgrade.conf)\" ] || echo >> /etc/sysupgrade.conf"
+        for kp in $keep_missing; do ssh_do "echo '$kp' >> /etc/sysupgrade.conf"; done
         echo "  Added"
     fi
 fi
@@ -509,10 +534,10 @@ if ssh_cmd "which tailscaled >/dev/null 2>&1"; then
         if ! $CHECK_ONLY; then
             alt_ver=$(ssh_cmd "/usr/bin/tailscale version 2>/dev/null | head -1" | tr -d '\r' || true)
             if [ -n "$alt_ver" ] && [ "$alt_ver" = "$daemon_ver" ]; then
-                ssh_cmd "ln -sf /usr/bin/tailscale /usr/sbin/tailscale"
+                ssh_do "ln -sf /usr/bin/tailscale /usr/sbin/tailscale"
                 echo "  Linked /usr/sbin/tailscale -> /usr/bin/tailscale ($alt_ver)"
             else
-                echo "  No CLI matching the daemon on the router; update Tailscale from the web UI (Applications > Tailscale)"
+                unresolved "No CLI matching the daemon on the router; update Tailscale from the web UI (Applications > Tailscale)"
             fi
         fi
     fi
@@ -527,7 +552,8 @@ if ssh_cmd "which tailscaled >/dev/null 2>&1"; then
         ts_ip=$(ssh_cmd "tailscale ip -4 2>/dev/null" || true)
         echo "  OK  Tailscale running ($ts_ip)"
     elif [ "$ts_status" = "NeedsLogin" ]; then
-        fix "Tailscale needs login: enable and log in from the web UI (Applications > Tailscale)"
+        fix "Tailscale needs login"
+        $CHECK_ONLY || unresolved "log in from the web UI (Applications > Tailscale)"
     else
         fix "Tailscale not running (state: ${ts_status:-unknown})"
         if ! $CHECK_ONLY; then
@@ -549,6 +575,10 @@ if $CHECK_ONLY; then
     fi
     echo "=== Dry run: everything OK. ==="
 else
+    if [ "$UNRESOLVED" -gt 0 ]; then
+        echo "=== Provisioning finished with $UNRESOLVED unresolved item(s); see ERROR lines above ==="
+        exit 1
+    fi
     echo "=== Provisioning complete ==="
     echo ""
     echo "Next steps:"
